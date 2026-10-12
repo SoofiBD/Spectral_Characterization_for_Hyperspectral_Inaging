@@ -1,7 +1,7 @@
 # Spectral Characterization Suite
 
-A desktop application that drives a motorized monochromator (Arduino, serial) and an Ocean Insight HDX
-spectrometer. It runs automated wavelength-accuracy and resolution scans, analyzes the results, and
+A desktop application that drives a motorized monochromator (Arduino, serial), an Ocean Insight HDX
+spectrometer and, optionally, a ZWO ASI camera (ASI533MM Pro) for hyperspectral imaging. It runs automated wavelength-accuracy and resolution scans, analyzes the results, and
 writes CSV data and PDF reports. A built-in **simulation mode** lets you run everything without hardware.
 
 ## Installation
@@ -61,13 +61,47 @@ In the monochromator port list, the `SIMULATED` entry always picks the fake devi
    optional backward scan, then click Start. Each point runs `GOTO:<nm>`, waits for `OK:DONE`,
    acquires and averages N spectra, then analyzes them. Plots and the table update live, and you can
    abort at any time.
+   * Optional **Camera (ZWO ASI, RAW16)** box: each point also takes one camera exposure after
+     the HDX spectra. The background step then also takes a camera dark frame.
    * Each scan creates `data/run_<timestamp>/`. `summary.csv` contains derived results;
      `dark.npz` and one numbered `.npz` per scan point preserve the full HDX wavelength axis
-     and every uncorrected exposure. `run.json` records acquisition settings and device identity.
-     Point files are written immediately, so completed points survive an aborted scan.
+     and every uncorrected exposure; `camera_dark.npy` and one numbered `.npy` per point hold the
+     untouched RAW16 camera frames. `manifest.json` (see below) records settings, devices,
+     timestamps and the SHA-256 of every raw file. Each point is written and recorded before
+     the next move, so completed points survive an aborted or crashed scan.
+   * **Export ENVI Cube** writes `data/run_<timestamp>_envi/cube.hdr|raw|json` (float32 BSQ,
+     forward points, camera dark subtracted) from the verified raw frames.
    * **Generate PDF Report** writes `reports/spectral_report_<timestamp>.pdf`, with the plot PNGs in
      `reports/plots/`.
    * **Load CSV…** reloads earlier results so you can re-plot them or build a new report.
+
+## Scan sequence and session manifest
+`acquisition/coordinator.py` is the only code that moves the monochromator during a scan.
+Per point: `GOTO` → `OK:DONE:<pos>` within the move timeout → reported position must be within
+0.5 nm of the target → settle → HDX raw exposures → camera RAW16 frame → files written and hashed →
+`manifest.json` updated. States: Preparing → Moving → Settling → Acquiring → Saving → Complete,
+or Stopping → Aborted / Failed. Abort cancels a running camera exposure; points already recorded
+are kept.
+
+`manifest.json` (`format_version` 2) is rewritten atomically after each point. It holds `status`
+(`running` while a scan is in progress; a `running` manifest that is left behind means the run was
+interrupted), parameters, device identity (port, HDX model/serial, camera model/serial/SDK),
+applied camera settings (exposure, gain, offset, bin, ROI, format, temperature), references
+(`hdx_dark`, `camera_dark` with their settings) and one entry per point (target/reported
+wavelength, UTC times, file names, sizes, SHA-256). `acquisition.session.load_verified(dir)`
+re-checks every file and returns only the points that verify. Nothing resumes automatically.
+White (flat) references are not taken by the scan.
+
+## Camera process (asi_camd)
+The ASI SDK runs in a separate C++ process, `hsi/lamda_hsi/build/asi_camd`, which writes frames
+directly into the session folder. Build it once (macOS needs `brew install libusb pkg-config cmake`):
+```bash
+cmake -S hsi/lamda_hsi -B hsi/lamda_hsi/build -DLAMDA_HSI_BUILD_GUI=OFF
+cmake --build hsi/lamda_hsi/build --target asi_camd
+```
+In simulation mode `devices/sim_camd.py` speaks the same protocol. The old ImGui app
+(`hsi/lamda_hsi`, built with `LAMDA_HSI_BUILD_GUI=ON`) opens the monochromator serial port
+itself: never run it while this application is connected.
 
 ## Serial protocol (9600 baud by default, selectable in the GUI; `\n` terminated)
 | Command | Responses |
@@ -100,7 +134,7 @@ For independent analysis, open a point `.npz` with `numpy.load`; `raw_scans` has
 exposure, and `wavelength_nm` is the shared full axis. The matching `dark.npz` contains
 `mean_raw` and its individual `raw_scans`. Subtract `mean_raw` from each light exposure before
 averaging or applying a different peak/FWHM/SNR method. A run without a valid dark has no
-`dark.npz`; check `run.json` before interpreting intensities. Slit fields show `0 = unknown`.
+`dark.npz`; check `manifest.json` (`references`) before interpreting intensities. Slit fields show `0 = unknown`.
 
 ## Project layout
 ```
@@ -114,7 +148,15 @@ gui/characterization_panel.py automated scan worker, 6 result plots, export
 gui/workers.py                thread-pool / QThread helpers
 analysis/spectral_analysis.py line analysis + statistics
 analysis/report_generator.py  ReportLab PDF
+analysis/cube_export.py       ENVI cube from verified RAW16 frames
+acquisition/coordinator.py    scan state machine (single monochromator owner)
+acquisition/session.py        session folder, manifest, checksum verification
+devices/asi_camera.py         asi_camd client (process, pipe protocol, abort)
+devices/sim_camd.py           simulated camera process
+hsi/lamda_hsi/src/asi_camd.cpp  C++ camera process (ASI SDK)
+hsi/lamda_hsi/                legacy C++ HSI app (ImGui), kept as a fallback
 tests/test_simulation.py      headless end-to-end test
+tests/test_scan.py            coordinator: timeout, position, abort, recovery, calibration
 ```
 
 All hardware I/O runs in worker threads, so the GUI never blocks. Both controllers are guarded by locks.
@@ -124,4 +166,6 @@ All hardware I/O runs in worker threads, so the GUI never blocks. Both controlle
 QT_QPA_PLATFORM=offscreen python tests/test_simulation.py
 ```
 This test checks every device command and error handling, live acquisition, a full 400–800 nm
-forward/backward scan, the CSV export and the PDF report.
+forward/backward scan, the CSV export, the PDF report, and a short camera scan with ENVI export.
+`python tests/test_scan.py` covers move timeout, position mismatch, abort during an exposure,
+interrupted/corrupted session recovery, mismatched camera dark and manifest path escape.

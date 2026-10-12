@@ -84,6 +84,22 @@ elseif(UNIX)
 endif()
 
 # -----------------------------------------------------------------------------
+# asi_camd: headless camera process used by the Python scan coordinator
+# -----------------------------------------------------------------------------
+add_executable(asi_camd src/asi_camd.cpp src/camera.cpp)
+target_include_directories(asi_camd PRIVATE src)
+target_link_libraries(asi_camd PRIVATE asi_sdk)
+target_compile_options(asi_camd PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+if(NOT ASI_LIB_STATIC)
+  set_target_properties(asi_camd PROPERTIES BUILD_RPATH "${ASI_LIB_DIR}")
+endif()
+
+# The legacy ImGui app opens the monochromator serial port itself: never run it during a
+# coordinated scan. -DLAMDA_HSI_BUILD_GUI=OFF builds only asi_camd (no network fetch).
+option(LAMDA_HSI_BUILD_GUI "Build the legacy lamda_hsi ImGui application" ON)
+if(LAMDA_HSI_BUILD_GUI)
+
+# -----------------------------------------------------------------------------
 # Third-party: GLFW + Dear ImGui via FetchContent
 # -----------------------------------------------------------------------------
 include(FetchContent)
@@ -224,3 +240,5 @@ message(STATUS "    build type : ${CMAKE_BUILD_TYPE}")
 message(STATUS "    ASI lib    : ${ASI_LIB_FILE}")
 message(STATUS "    libusb     : ${LIBUSB_LIBRARIES}")
 message(STATUS "")
+
+endif()  # LAMDA_HSI_BUILD_GUI

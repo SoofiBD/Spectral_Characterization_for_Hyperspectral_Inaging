@@ -3,6 +3,7 @@
     QT_QPA_PLATFORM=offscreen python tests/test_simulation.py
 """
 
+import json
 import sys
 import tempfile
 import time
@@ -114,6 +115,25 @@ def test_gui():
         assert abs(peak - df.iloc[0]["measured_peak"]) < 1e-6
     pdf = cp.generate_pdf(interactive=False)
     assert pdf and pdf.stat().st_size > 50_000
+    manifest = json.loads((cp.run_dir / "manifest.json").read_text())
+    assert manifest["status"] == "complete" and len(manifest["points"]) == 81
+    assert not cp.envi_btn.isEnabled()  # no camera in this run
+
+    # Short scan with the simulated camera process, then the ENVI cube from its RAW16 frames
+    cp.cam_box.setChecked(True)
+    cp.cam_exp_spin.setValue(1)
+    cp.cam_bin_spin.setValue(4)
+    cp.start_spin.setValue(500)
+    cp.stop_spin.setValue(520)
+    cp.bwd_chk.setChecked(False)
+    cp.start_btn.click()
+    wait_until(app, lambda: cp.worker is None and len(cp.rows) == 3, timeout=120)
+    manifest = json.loads((cp.run_dir / "manifest.json").read_text())
+    assert manifest["status"] == "complete" and "camera_dark" in manifest["references"]
+    assert all(pt["camera"]["width"] == 752 for pt in manifest["points"])
+    hdr = cp.export_cube()
+    assert hdr and "bands = 3" in hdr.read_text(), hdr
+    print("camera scan + ENVI OK:", hdr)
     print("GUI OK:", cp.summary_lbl.text().replace("\n", " | "))
     print("CSV:", cp.last_csv, "\nPDF:", pdf)
     win.grab().save(str(tmp / "screenshot.png"))

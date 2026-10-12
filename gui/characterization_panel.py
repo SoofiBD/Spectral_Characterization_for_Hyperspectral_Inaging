@@ -5,7 +5,6 @@ from __future__ import annotations
 import datetime as dt
 import json
 import threading
-import time
 from pathlib import Path
 
 import numpy as np
@@ -15,24 +14,20 @@ import pyqtgraph.exporters
 from PySide6.QtCore import QThread, Signal, Qt
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDoubleSpinBox, QFileDialog,
                                QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
-                               QMessageBox, QProgressBar, QPushButton, QSpinBox, QSplitter,
+                               QMessageBox, QProgressBar, QPushButton, QScrollArea, QSpinBox, QSplitter,
                                QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
+from acquisition.coordinator import ScanCoordinator, State, scan_plan
+from analysis.cube_export import export_envi
 from analysis.report_generator import generate_report
 from analysis.spectral_analysis import (CSV_COLUMNS, analyze_spectrum, peak_repeatability,
                                         relative_response, summarize)
+from devices.asi_camera import ASICameraClient, CameraError
 from devices.monochromator import MonochromatorController
 from devices.ocean_hdx import OceanHDXController
 from gui.widgets import IntSpinBox, NumberSpinBox, commit_spinboxes
 
 PROFILE_EVERY_NM = 50  # keep the averaged spectrum of every set wavelength that is a multiple of this
-
-
-def save_spectra(path: Path, **arrays):
-    temporary = path.with_suffix(".tmp")
-    with temporary.open("wb") as output:
-        np.savez_compressed(output, **arrays)
-    temporary.replace(path)
 
 PLOT_DEFS = [
     ("accuracy", "Wavelength Accuracy", "Set wavelength (nm)", "Measured wavelength (nm)"),
@@ -58,6 +53,7 @@ class CharacterizationWorker(QThread):
         super().__init__(parent)
         self.mono, self.hdx, self.p = mono, hdx, params
         self.run_dir = run_dir
+        self.coordinator: ScanCoordinator | None = None
         self._abort = False
         self._answer = threading.Event()
         self._answer_ok = False
@@ -66,6 +62,8 @@ class CharacterizationWorker(QThread):
         self._abort = True
         self._answer_ok = False
         self._answer.set()
+        if self.coordinator is not None:
+            self.coordinator.abort()
 
     def answer(self, ok: bool):
         self._answer_ok = ok
@@ -78,83 +76,42 @@ class CharacterizationWorker(QThread):
         self._answer.wait()
         return self._answer_ok and not self._abort
 
-    def _measure_dark(self):
-        p = self.p
-        sim = self.hdx.sim_state if self.hdx.is_simulated else None
-        if sim is None and not self._prompt(
-                "Background measurement: block the light (close the shutter or turn the lamp off), "
-                "then press OK."):
-            raise RuntimeError("Background measurement cancelled")
-        self.status.emit(f"Measuring background ({p['dark_averages']}× at {p['integration_ms']:g} ms)…")
-        if sim:
-            sim.light_blocked = True
-        try:
-            self.hdx.acquire_dark(p["dark_averages"])
-        finally:
-            if sim:
-                sim.light_blocked = False
-        if sim is None and not self._prompt("Background stored. Restore the light, then press OK to start the scan."):
-            raise RuntimeError("Scan cancelled after background measurement")
-
-    @staticmethod
-    def wavelengths(start, stop, step) -> np.ndarray:
-        n = int(np.floor(round((stop - start) / step, 9))) + 1
-        return np.round(start + step * np.arange(n), 6)
+    def _on_point(self, point: dict, wl: np.ndarray, raw_scans: list):
+        """Analysis of one completed (already saved) point; raw data is never changed here."""
+        w = point["target_nm"]
+        scans = [scan - self.hdx.dark if self.hdx.dark_active else scan for scan in raw_scans]
+        avg = np.mean(scans, axis=0)
+        res = analyze_spectrum(wl, avg, w).to_dict()
+        mean_pk, std_pk = peak_repeatability(wl, scans, w)
+        res.update(direction=point["direction"], peak_mean_nm=mean_pk, peak_std_nm=std_pk,
+                   reported_position=point["reported_nm"],
+                   saturated_pixels=int(np.count_nonzero(np.asarray(raw_scans) >= 65535)))
+        self.point_done.emit(res, wl, avg)
+        self.progress.emit(point["index"] + 1, self._total)
 
     def run(self):
         p = self.p
-        fwd = self.wavelengths(p["start"], p["stop"], p["step"])
-        plan = [("forward", w) for w in fwd]
-        if p["backward"]:
-            plan += [("backward", w) for w in fwd[-2::-1]]
+        self._total = len(scan_plan(p["start"], p["stop"], p["step"], p["backward"]))
+        camera = None
         try:
-            self.hdx.set_integration_time(p["integration_ms"])
-            if p["measure_dark"]:
-                self._measure_dark()
+            if p.get("camera"):
+                camera = ASICameraClient(simulate=p["camera"]["simulate"], log_path=self.run_dir / "camera.log")
             self.hdx.subtract_dark = True
             p["dark"] = ("measured before scan" if p["measure_dark"] else
-                         "existing dark" if self.hdx.dark_active else "none (raw counts)")
-            (self.run_dir / "run.json").write_text(json.dumps({
-                "format_version": 1, "parameters": p,
-                "spectrometer": self.hdx.device_info, "monochromator_port": self.mono.port,
-                "dark_subtracted_for_analysis": self.hdx.dark_active,
-            }, indent=2))
-            if self.hdx.dark_active:
-                save_spectra(self.run_dir / "dark.npz", wavelength_nm=self.hdx.wavelengths,
-                             raw_scans=np.asarray(self.hdx.dark_scans), mean_raw=self.hdx.dark)
-            # Approach the start from below so the forward scan has a consistent backlash direction
-            self.status.emit("Pre-positioning…")
-            self.mono.goto(max(fwd[0] - 2 * p["step"], 200.0))
-            for i, (direction, w) in enumerate(plan):
-                if self._abort:
-                    self.status.emit("Aborted")
-                    return
-                self.status.emit(f"{direction}: GOTO {w:g} nm")
-                self.mono.goto(float(w))
-                if p["settle_s"] > 0:
-                    time.sleep(p["settle_s"])
-                self.status.emit(f"{direction}: acquiring {p['averages']}× at {w:g} nm")
-                raw_scans = [self.hdx.acquire_raw()[1] for _ in range(p["averages"])]
-                wl = self.hdx.wavelengths
-                save_spectra(self.run_dir / f"{i:04d}_{direction}_{w:g}nm.npz",
-                             wavelength_nm=wl, raw_scans=np.asarray(raw_scans),
-                             set_wavelength_nm=float(w), direction=direction,
-                             reported_position_nm=self.mono.position_nm,
-                             integration_ms=p["integration_ms"],
-                             captured_at_utc=dt.datetime.now(dt.timezone.utc).isoformat())
-                scans = [scan - self.hdx.dark if self.hdx.dark_active else scan
-                         for scan in raw_scans]
-                avg = np.mean(scans, axis=0)
-                res = analyze_spectrum(wl, avg, float(w)).to_dict()
-                mean_pk, std_pk = peak_repeatability(wl, scans, float(w))
-                res.update(direction=direction, peak_mean_nm=mean_pk, peak_std_nm=std_pk,
-                           reported_position=self.mono.position_nm,
-                           saturated_pixels=int(np.count_nonzero(np.asarray(raw_scans) >= 65535)))
-                self.point_done.emit(res, wl, avg)
-                self.progress.emit(i + 1, len(plan))
-            self.status.emit("Scan complete")
+                         "existing dark" if self.hdx.dark_valid else "none (raw counts)")
+            self.coordinator = ScanCoordinator(
+                self.mono, self.hdx, p, self.run_dir, camera, prompt=self._prompt,
+                on_state=lambda state, detail: self.status.emit(
+                    f"{state.value}: {detail}" if detail else state.value),
+                on_point=self._on_point)
+            if self._abort:  # aborted while the camera process was starting
+                return
+            self.coordinator.run()
         except Exception as exc:
             self.failed.emit(str(exc))
+        finally:
+            if camera is not None:
+                camera.close()
 
 
 # ---------------------------------------------------------------------- plotting
@@ -295,6 +252,20 @@ class CharacterizationPanel(QWidget):
         f.addRow("Dark averages:", self.dark_avg_spin)
         self.dark_chk.toggled.connect(self.dark_avg_spin.setEnabled)
 
+        cam_box = QGroupBox("Camera (ZWO ASI, RAW16)")
+        cam_box.setCheckable(True)
+        cam_box.setChecked(False)
+        self.cam_box = cam_box
+        self.cam_exp_spin = NumberSpinBox(decimals=3, minimum=0.032, maximum=600_000, value=100, suffix=" ms")
+        self.cam_gain_spin = IntSpinBox(minimum=0, maximum=600, value=100)
+        self.cam_offset_spin = IntSpinBox(minimum=0, maximum=255, value=50)
+        self.cam_bin_spin = IntSpinBox(minimum=1, maximum=4, value=1)
+        cf = QFormLayout(cam_box)
+        cf.addRow("Exposure:", self.cam_exp_spin)
+        cf.addRow("Gain:", self.cam_gain_spin)
+        cf.addRow("Offset:", self.cam_offset_spin)
+        cf.addRow("Binning:", self.cam_bin_spin)
+
         run_box = QGroupBox("Run")
         self.start_btn = QPushButton("▶  Start Characterization")
         self.start_btn.setObjectName("primary")
@@ -312,10 +283,12 @@ class CharacterizationPanel(QWidget):
         self.csv_btn = QPushButton("Export CSV…")
         self.load_btn = QPushButton("Load CSV…")
         self.pdf_btn = QPushButton("Generate PDF Report")
+        self.envi_btn = QPushButton("Export ENVI Cube")
         self.csv_btn.setEnabled(False)
         self.pdf_btn.setEnabled(False)
+        self.envi_btn.setEnabled(False)
         ol = QVBoxLayout(out_box)
-        for w in (self.csv_btn, self.load_btn, self.pdf_btn):
+        for w in (self.csv_btn, self.load_btn, self.pdf_btn, self.envi_btn):
             ol.addWidget(w)
 
         summ_box = QGroupBox("Summary")
@@ -325,12 +298,18 @@ class CharacterizationPanel(QWidget):
         QVBoxLayout(summ_box).addWidget(self.summary_lbl)
 
         side = QVBoxLayout()
-        for b in (pg_box, run_box, out_box, summ_box):
+        for b in (pg_box, cam_box, run_box, out_box, summ_box):
             side.addWidget(b)
         side.addStretch(1)
-        sw = QWidget()
-        sw.setLayout(side)
-        sw.setFixedWidth(320)
+        inner = QWidget()
+        inner.setLayout(side)
+        inner.setFixedWidth(320)
+        sw = QScrollArea()  # the parameter column no longer fits short screens
+        sw.setWidget(inner)
+        sw.setWidgetResizable(True)
+        sw.setFrameShape(QScrollArea.NoFrame)
+        sw.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        sw.setFixedWidth(320 + sw.verticalScrollBar().sizeHint().width() + 2)
 
         # Live spectrum + result tabs
         self.live_plot = pg.PlotWidget(title="Current Spectrum")
@@ -371,6 +350,7 @@ class CharacterizationPanel(QWidget):
         self.csv_btn.clicked.connect(self.export_csv_dialog)
         self.load_btn.clicked.connect(self.load_csv)
         self.pdf_btn.clicked.connect(self.generate_pdf)
+        self.envi_btn.clicked.connect(self.export_cube)
 
     # ------------------------------------------------------------------ run control
     @property
@@ -393,7 +373,13 @@ class CharacterizationPanel(QWidget):
                            backward=self.bwd_chk.isChecked(),
                            measure_dark=self.dark_chk.isChecked(),
                            dark_averages=self.dark_avg_spin.value(),
-                           simulation=self.mono.is_simulated or self.hdx.is_simulated)
+                           simulation=self.mono.is_simulated or self.hdx.is_simulated,
+                           camera=dict(exposure_us=round(self.cam_exp_spin.value() * 1000),
+                                       gain=self.cam_gain_spin.value(),
+                                       offset=self.cam_offset_spin.value(),
+                                       bin=self.cam_bin_spin.value(),
+                                       simulate=bool(self.simulation_enabled()))
+                           if self.cam_box.isChecked() else None)
         self.rows.clear()
         self.profiles.clear()
         self.table.setRowCount(0)
@@ -426,6 +412,8 @@ class CharacterizationPanel(QWidget):
         self.load_btn.setEnabled(not running)
         self.csv_btn.setEnabled(not running and bool(self.rows))
         self.pdf_btn.setEnabled(not running and bool(self.rows))
+        self.envi_btn.setEnabled(not running and bool(self.params.get("camera")) and self.run_dir is not None)
+        self.cam_box.setEnabled(not running)
         self.running_changed.emit(running)
 
     def _on_point(self, res: dict, wl, avg):
@@ -557,3 +545,14 @@ class CharacterizationPanel(QWidget):
         if interactive:
             QMessageBox.information(self, "Report generated", f"Report saved to:\n{out}")
         return out
+
+    def export_cube(self) -> Path | None:
+        """ENVI cube from the run's verified RAW16 frames (forward scan); raw files stay untouched."""
+        try:
+            hdr = export_envi(self.run_dir, self.run_dir.parent / f"{self.run_dir.name}_envi")
+        except Exception as exc:
+            self.log_message.emit(f"ENVI export failed: {exc}")
+            QMessageBox.critical(self, "ENVI export failed", str(exc))
+            return None
+        self.log_message.emit(f"ENVI cube written to {hdr}")
+        return hdr
