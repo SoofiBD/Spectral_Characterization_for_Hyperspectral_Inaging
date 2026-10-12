@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=LAMDA HyperSpectral Imaging System
+Comment=LAMDA laboratory hyperspectral imaging acquisition system
+Exec=@MC_DESKTOP_EXEC@
+Icon=@MC_DESKTOP_ICON@
+Terminal=false
+Categories=Science;Photography;
+StartupWMClass=lamda_hsi

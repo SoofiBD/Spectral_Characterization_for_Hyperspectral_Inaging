@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# C++ build
+build/
+build-*/
+*.o
+*.obj
+compile_commands.json
+
+# Measurements and generated output (re-measure / regenerate)
+data/
+reports/
+captures/
+
+# Vendor SDK binaries: keep locally, not in git
+hsi/lamda_hsi/ASI_linux_mac_SDK_V1.41/lib/
+
+# Editors / OS
+.cache/
+.claude/
+.vscode/
+.idea/
+.DS_Store
