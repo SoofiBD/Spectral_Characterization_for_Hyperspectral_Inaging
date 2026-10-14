@@ -14,6 +14,8 @@ Protocol (9600 baud by default, newline terminated ASCII):
 
 from __future__ import annotations
 
+import math
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -179,7 +181,8 @@ class MonochromatorController:
                 if not port:
                     raise MonochromatorError("No COM port selected")
                 try:
-                    self._ser = serial.Serial(port, baudrate, timeout=timeout)
+                    self._ser = serial.Serial(port, baudrate, timeout=timeout,
+                                              **({"exclusive": True} if os.name == "posix" else {}))
                 except serial.SerialException as exc:
                     raise MonochromatorError(f"Cannot open {port}: {exc}") from exc
                 self.port = port
@@ -210,6 +213,7 @@ class MonochromatorController:
                 except Exception:
                     pass
             self._ser = None
+            self.position_nm = None  # a port reopen resets the Arduino: re-read POS before trusting it
             self.port = None
 
     # ------------------------------------------------------------------ low level
@@ -268,7 +272,10 @@ class MonochromatorController:
     @staticmethod
     def _parse_position(line: str) -> float:
         try:
-            return float(line.rsplit(":", 1)[1])
+            value = float(line.rsplit(":", 1)[1])
+            if not math.isfinite(value):
+                raise ValueError("non-finite position")
+            return value
         except (IndexError, ValueError) as exc:
             raise MonochromatorError(f"Cannot parse position from '{line}'") from exc
 

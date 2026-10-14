@@ -8,6 +8,10 @@ Acquisition is sequential (HDX, then camera); simultaneous exposure is not imple
 from __future__ import annotations
 
 import platform
+import math
+import subprocess
+import threading
+import copy
 import sys
 import time
 from enum import Enum
@@ -17,9 +21,9 @@ from typing import Callable
 import numpy as np
 
 from acquisition.session import Session, save_spectra, utc_now
-from devices.asi_camera import ASICameraClient, CameraError
+from devices.asi_camera import CameraError
+from devices.contracts import Camera, Spectrometer, scan_access
 from devices.monochromator import MOVE_TIMEOUT_S, MonochromatorController, MonochromatorError
-from devices.ocean_hdx import OceanHDXController
 
 POSITION_TOLERANCE_NM = 0.5  # reported vs target; lab firmware reports within ~0.01 nm
 
@@ -42,6 +46,8 @@ class ScanAborted(Exception):
 
 
 def scan_plan(start: float, stop: float, step: float, backward: bool) -> list[tuple[str, float]]:
+    if not all(math.isfinite(x) for x in (start, stop, step)) or step <= 0 or stop < start:
+        raise ValueError("Invalid scan range or step")
     n = int(np.floor(round((stop - start) / step, 9))) + 1
     fwd = np.round(start + step * np.arange(n), 6)
     plan = [("forward", float(w)) for w in fwd]
@@ -51,24 +57,27 @@ def scan_plan(start: float, stop: float, step: float, backward: bool) -> list[tu
 
 
 class ScanCoordinator:
-    def __init__(self, mono: MonochromatorController, hdx: OceanHDXController, params: dict,
-                 session_dir: Path, camera: ASICameraClient | None = None,
+    def __init__(self, mono: MonochromatorController, hdx: Spectrometer, params: dict,
+                 session_dir: Path, camera: Camera | None = None,
                  prompt: Callable[[str], bool] | None = None,
                  on_state: Callable[[State, str], None] | None = None,
                  on_point: Callable[[dict, np.ndarray, list], None] | None = None):
         self.mono, self.hdx, self.camera, self.p = mono, hdx, camera, params
         self.session_dir = session_dir
-        self.prompt = prompt or (lambda text: True)
+        self.prompt = prompt
         self.on_state = on_state or (lambda state, detail: None)
         self.on_point = on_point or (lambda point, wl, raw: None)
         self.state = State.IDLE
         self.session: Session | None = None
         self._camera_dark: dict | None = None
         self._abort = False
+        self._stop = threading.Event()
 
     def abort(self):
         """Stop before the next move/exposure; a running camera exposure is cancelled."""
         self._abort = True
+        self._stop.set()
+        self._set(State.STOPPING, "Waiting for active device I/O; motor motion is not physically stopped")
         if self.camera is not None:
             self.camera.abort()
 
@@ -82,11 +91,32 @@ class ScanCoordinator:
 
     # ------------------------------------------------------------------ run
     def run(self) -> Session:
+        with scan_access(self.mono, self.hdx):
+            return self._run_owned()
+
+    def _run_owned(self) -> Session:
         """Run the scan. Returns the session; raises on failure (manifest says "failed")."""
+        modes = {self.mono.is_simulated, self.hdx.is_simulated}
+        if self.camera is not None:
+            modes.add(self.camera.simulated)
+        if len(modes) != 1:
+            raise ValueError("Mixed real/simulated devices are not allowed")
+        scan_plan(self.p["start"], self.p["stop"], self.p["step"], self.p["backward"])
+        if not math.isfinite(self.p["settle_s"]) or self.p["settle_s"] < 0:
+            raise ValueError("Invalid settling time")
+        if any(not isinstance(self.p[k], int) or self.p[k] < 1 for k in ("averages", "dark_averages")):
+            raise ValueError("Exposure counts must be positive")
+        for key, default in (("position_tolerance_nm", POSITION_TOLERANCE_NM), ("move_timeout_s", MOVE_TIMEOUT_S)):
+            if not math.isfinite(self.p.get(key, default)) or self.p.get(key, default) < 0:
+                raise ValueError(f"Invalid {key}")
+        if self.p.get("kind") == "white" and not self.p["measure_dark"]:
+            raise ValueError("A white-reference run requires a fresh dark measurement")
         self._set(State.PREPARING)
         self.session = Session(self.session_dir, self._session_info())
         try:
+            self._check_abort()
             self._run()
+            self._check_abort()
         except Exception as exc:
             if self._abort and isinstance(exc, (ScanAborted, CameraError)):
                 self._set(State.STOPPING)
@@ -107,50 +137,92 @@ class ScanCoordinator:
             c = p["camera"]
             s.manifest["camera_settings"] = self.camera.configure(
                 c["exposure_us"], c["gain"], c["offset"], c["bin"], tuple(c.get("roi", (0, 0, 0, 0))))
+        s.manifest["parameters"]["dark"] = ("measured before scan" if p["measure_dark"] else
+                                                "existing dark" if self.hdx.dark_active else "none (raw counts)")
+        s.checkpoint()
         if p["measure_dark"]:
             self._measure_dark()
-        self._record_references()
+        else:
+            self._record_references()
+        if p.get("kind") == "white" and not self.hdx.is_simulated:
+            self._confirm("Place the uniform white reference in the measurement plane, then press OK.")
         plan = scan_plan(p["start"], p["stop"], p["step"], p["backward"])
         # Approach the start from below so the forward scan has a consistent backlash direction
         self._check_abort()
         self._set(State.MOVING, "pre-positioning")
-        self.mono.goto(max(plan[0][1] - 2 * p["step"], 200.0), p.get("move_timeout_s", MOVE_TIMEOUT_S))
+        target = max(plan[0][1] - 2 * p["step"], 200.0)
+        reported, timing = self._move(target)
+        s.manifest["preposition"] = {"target_nm": target, "reported_nm": reported, **timing}
+        s.checkpoint()
         for i, (direction, w) in enumerate(plan):
             self._point(i, direction, w)
+
+    def _move(self, target):
+        started, clock = utc_now(), time.monotonic()
+        reported = self.mono.goto(target, self.p.get("move_timeout_s", MOVE_TIMEOUT_S))
+        tolerance = self.p.get("position_tolerance_nm", POSITION_TOLERANCE_NM)
+        if not math.isfinite(tolerance) or tolerance < 0:
+            raise ValueError("Invalid position tolerance")
+        if not math.isfinite(reported) or abs(reported - target) > tolerance:
+            raise MonochromatorError(f"Reported position {reported:g} nm differs from target {target:g} nm")
+        return reported, {"started_utc": started, "finished_utc": utc_now(),
+                          "duration_s": time.monotonic() - clock}
 
     def _point(self, i: int, direction: str, w: float):
         p, s = self.p, self.session
         self._check_abort()
         self._set(State.MOVING, f"{direction}: GOTO {w:g} nm")
-        reported = self.mono.goto(w, p.get("move_timeout_s", MOVE_TIMEOUT_S))
-        tol = p.get("position_tolerance_nm", POSITION_TOLERANCE_NM)
-        if abs(reported - w) > tol:
-            raise MonochromatorError(f"Reported position {reported:g} nm differs from target "
-                                     f"{w:g} nm by more than {tol:g} nm")
+        reported, move = self._move(w)
+        self._check_abort()
         self._set(State.SETTLING, f"{direction}: {w:g} nm")
-        time.sleep(p["settle_s"])
+        self._stop.wait(p["settle_s"])
         self._check_abort()
         self._set(State.ACQUIRING, f"{direction}: {p['averages']}× at {w:g} nm")
-        started = utc_now()
-        raw = [self.hdx.acquire_raw()[1] for _ in range(p["averages"])]
-        wl = self.hdx.wavelengths
         stem = f"{i:04d}_{direction}_{w:g}nm"
-        frame = None
-        if self.camera is not None:
+        point = {"index": i, "status": "partial", "direction": direction, "target_nm": w,
+                 "reported_nm": reported, "move": move, "started_utc": utc_now(),
+                 "settle_s": p["settle_s"], "hdx_exposures": [],
+                 "references": list(s.manifest["references"])}
+        s.add_point(point)
+        raw, wl = [], self.hdx.wavelengths
+        for j in range(p["averages"]):
             self._check_abort()
-            frame = self.camera.expose(s.root / f"{stem}.npy")
-        self._set(State.SAVING, f"{direction}: {w:g} nm")
+            started = utc_now()
+            axis, counts = self.hdx.acquire_raw()
+            if not np.array_equal(axis, wl) or counts.shape != wl.shape:
+                raise ValueError("Spectrometer wavelength axis or shape changed during scan")
+            finished = utc_now()
+            name = f"{stem}_exposure{j:04d}.npz"
+            save_spectra(s.root / name, wavelength_nm=wl, raw_scans=counts[None, :],
+                         integration_ms=self.hdx.integration_time_ms, captured_at_utc=started)
+            point["hdx_exposures"].append({**s.record(name), "started_utc": started,
+                                            "finished_utc": finished})
+            s.checkpoint()
+            raw.append(counts)
         save_spectra(s.root / f"{stem}.npz", wavelength_nm=wl, raw_scans=np.asarray(raw),
                      set_wavelength_nm=w, direction=direction, reported_position_nm=reported,
-                     integration_ms=p["integration_ms"], captured_at_utc=started)
-        point = {"index": i, "direction": direction, "target_nm": w, "reported_nm": reported,
-                 "started_utc": started, "finished_utc": utc_now(), "settle_s": p["settle_s"],
-                 "hdx": {**s.record(f"{stem}.npz"), "integration_ms": p["integration_ms"],
-                         "n_scans": len(raw)},
-                 "references": [r for r in ("hdx_dark", "camera_dark") if r in s.manifest["references"]]}
-        if frame is not None:
-            point["camera"] = {**s.record(f"{stem}.npy"), **frame}
-        s.add_point(point)
+                     integration_ms=self.hdx.integration_time_ms, captured_at_utc=point["started_utc"])
+        point["hdx"] = {**s.record(f"{stem}.npz"), "integration_ms": self.hdx.integration_time_ms,
+                        "n_scans": len(raw)}
+        s.checkpoint()
+        self._check_abort()
+        if self.camera is not None:
+            if self.camera.simulated and hasattr(self.camera, "set_scene"):
+                self.camera.set_scene(w, False, p.get("kind") == "white")
+            started = utc_now()
+            frame = self.camera.expose(s.root / f"{stem}.npy")
+            pixels = np.load(s.root / f"{stem}.npy", mmap_mode="r", allow_pickle=False)
+            if pixels.dtype != np.dtype("uint16") or pixels.ndim != 2 or pixels.shape != (frame["height"], frame["width"]):
+                raise CameraError("Camera driver did not return a valid RAW16 frame")
+            maximum = self.camera.info.get("max_intensity")
+            frame["saturated_pixels"] = int(np.count_nonzero(pixels >= maximum)) if maximum is not None else None
+            point["camera"] = {**frame, **s.record(f"{stem}.npy"),
+                               "started_utc": started, "finished_utc": utc_now()}
+            s.checkpoint()
+        self._check_abort()
+        self._set(State.SAVING, f"{direction}: {w:g} nm")
+        point.update(status="complete", finished_utc=utc_now())
+        s.checkpoint()
         self.on_point(point, wl, raw)
 
     # ------------------------------------------------------------------ references
@@ -164,10 +236,30 @@ class ScanCoordinator:
         if sim:
             sim.light_blocked = True
         try:
-            self.hdx.acquire_dark(p["dark_averages"])
+            scans = []
+            s = self.session
+            s.manifest["dark_exposures"] = []
+            for i in range(p["dark_averages"]):
+                self._check_abort()
+                started = utc_now()
+                wl, counts = self.hdx.acquire_raw()
+                name = f"dark_exposure{i:04d}.npz"
+                save_spectra(s.root / name, wavelength_nm=wl, raw_scans=counts[None, :],
+                             integration_ms=self.hdx.integration_time_ms, captured_at_utc=started)
+                s.manifest["dark_exposures"].append(s.record(name))
+                s.checkpoint()
+                scans.append(counts)
+            self.hdx.dark_scans = scans
+            self.hdx.dark = np.mean(scans, axis=0)
+            self.hdx.dark_integration_ms = self.hdx.integration_time_ms
+            self.hdx.dark_captured_utc = utc_now()
+            self._record_references()
             if self.camera is not None:
                 self._check_abort()
+                if self.camera.simulated and hasattr(self.camera, "set_scene"):
+                    self.camera.set_scene(p["start"], True, False)
                 self._camera_dark = self.camera.expose(self.session.root / "camera_dark.npy")
+                self._record_references()
         finally:
             if sim:
                 sim.light_blocked = False
@@ -176,22 +268,26 @@ class ScanCoordinator:
 
     def _confirm(self, text: str):
         """Operator step; Cancel ends the scan as aborted (nothing measured is lost)."""
+        if self.prompt is None:
+            raise RuntimeError("A real reference measurement requires operator confirmation")
+        self._check_abort()
         if not self.prompt(text):
             self._abort = True
         self._check_abort()
 
     def _record_references(self):
         s = self.session
-        if self.hdx.dark_active:
+        if self.hdx.dark_active and "hdx_dark" not in s.manifest["references"]:
             save_spectra(s.root / "dark.npz", wavelength_nm=self.hdx.wavelengths,
                          raw_scans=np.asarray(self.hdx.dark_scans), mean_raw=self.hdx.dark)
             s.set_reference("hdx_dark", {**s.record("dark.npz"),
+                                         "captured_utc": getattr(self.hdx, "dark_captured_utc", None),
                                          "integration_ms": self.hdx.dark_integration_ms,
                                          "n_scans": len(self.hdx.dark_scans),
                                          "measured_in_this_session": bool(self.p["measure_dark"])})
-        if self._camera_dark is not None:
+        if self._camera_dark is not None and "camera_dark" not in s.manifest["references"]:
             # Settings travel with the reference so analysis can refuse a mismatched dark
-            s.set_reference("camera_dark", {**s.record("camera_dark.npy"), **self._camera_dark,
+            s.set_reference("camera_dark", {**self._camera_dark, **s.record("camera_dark.npy"),
                                             "settings": s.manifest["camera_settings"]})
         # White (flat) references are separate measurements and are not taken by this scan.
 
@@ -203,9 +299,16 @@ class ScanCoordinator:
         devices = {"monochromator": {"port": self.mono.port, "simulated": self.mono.is_simulated,
                                      "status": mono_status},
                    "spectrometer": {"info": self.hdx.device_info, "backend": self.hdx.backend,
-                                    "simulated": self.hdx.is_simulated}}
+                                    "simulated": self.hdx.is_simulated, "max_intensity": self.hdx.max_intensity}}
         if self.camera is not None:
             devices["camera"] = {**self.camera.info, "simulated": self.camera.simulated}
-        return {"parameters": self.p, "devices": devices,
-                "software": {"python": sys.version.split()[0], "numpy": np.__version__,
+        try:
+            revision = subprocess.check_output(["git", "rev-parse", "HEAD"],
+                cwd=Path(__file__).resolve().parents[1], text=True, stderr=subprocess.DEVNULL).strip()
+            dirty = bool(subprocess.check_output(["git", "diff", "HEAD", "--"],
+                cwd=Path(__file__).resolve().parents[1], stderr=subprocess.DEVNULL))
+        except (OSError, subprocess.CalledProcessError):
+            revision, dirty = None, None
+        return {"parameters": copy.deepcopy(self.p), "devices": devices,
+                "software": {"revision": revision, "dirty": dirty, "python": sys.version.split()[0], "numpy": np.__version__,
                              "platform": platform.platform()}}

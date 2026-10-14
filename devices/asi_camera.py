@@ -8,6 +8,8 @@ only short status lines travel over the pipe. Protocol: see hsi/lamda_hsi/src/as
 from __future__ import annotations
 
 import json
+import hashlib
+import os
 import queue
 import signal
 import subprocess
@@ -42,6 +44,7 @@ class ASICameraClient:
         self._lines: queue.Queue[str | None] = queue.Queue()
         self._lock = threading.Lock()
         self.settings: dict | None = None
+        self._abort_timer = None
         try:
             self._proc = subprocess.Popen(cmd + [str(index)], stdin=subprocess.PIPE,
                                           stdout=subprocess.PIPE, stderr=self._log, text=True,
@@ -52,6 +55,10 @@ class ASICameraClient:
         threading.Thread(target=self._read_stdout, daemon=True).start()
         try:
             self.info = self._reply("READY", STARTUP_TIMEOUT_S)
+            if self.info.get("protocol_version") != 2:
+                raise CameraError("Camera daemon protocol is outdated; rebuild asi_camd")
+            if not simulate:
+                self.info["driver_sha256"] = hashlib.sha256(CAMD_EXE.read_bytes()).hexdigest()
         except CameraError:
             self.close()
             raise
@@ -73,6 +80,7 @@ class ASICameraClient:
         try:
             line = self._lines.get(timeout=timeout)
         except queue.Empty:
+            self.abort()
             self.close()
             raise CameraError(f"Camera did not answer within {timeout:g} s") from None
         if line is None:
@@ -108,19 +116,41 @@ class ASICameraClient:
             COMMAND_TIMEOUT_S)
         return self.settings
 
+    def set_scene(self, wavelength_nm: float, dark: bool, white: bool = False):
+        if not self.simulated:
+            raise CameraError("SCENE is only available in simulation")
+        self._command(f"SCENE {wavelength_nm} {int(dark)} {int(white)}", COMMAND_TIMEOUT_S)
+
     def expose(self, path: Path) -> dict:
         """Take one exposure and write it to `path` (.npy, uint16). Returns frame metadata."""
         if self.settings is None:
             raise CameraError("Camera not configured")
-        if "\n" in str(path):
+        if path.exists():
+            raise FileExistsError(f"Raw frame already exists: {path}")
+        if "\n" in str(path) or "\r" in str(path):
             raise CameraError("Invalid frame path")
         timeout = self.settings["exposure_us"] / 1e6 + READOUT_MARGIN_S
-        return self._command(f"EXPOSE {path}", timeout)
+        result = self._command(f"EXPOSE {path}", timeout)
+        return {**result, "settings": dict(self.settings)}
 
     def abort(self):
         """Stop a running exposure and end the process; open a new client for the next scan."""
         if self._proc.poll() is None:
-            self._proc.send_signal(signal.SIGTERM)
+            try:
+                self._proc.send_signal(signal.SIGTERM)
+            except ProcessLookupError:
+                return
+            # Bound cancellation even when an SDK call cannot return to its polling loop.
+            if self._abort_timer is None:
+                def kill_if_stuck():
+                    if self._proc.poll() is None:
+                        try:
+                            self._proc.kill()
+                        except ProcessLookupError:
+                            pass
+                self._abort_timer = threading.Timer(3.0, kill_if_stuck)
+                self._abort_timer.daemon = True
+                self._abort_timer.start()
 
     def close(self):
         if self._proc.poll() is None:
@@ -134,6 +164,8 @@ class ASICameraClient:
             except subprocess.TimeoutExpired:
                 self._proc.kill()
                 self._proc.wait()
+        if self._abort_timer is not None:
+            self._abort_timer.cancel()
         for pipe in (self._proc.stdin, self._proc.stdout):
             try:
                 pipe.close()

@@ -5,13 +5,14 @@ from __future__ import annotations
 import datetime as dt
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (QDockWidget, QLabel, QMainWindow, QMessageBox, QPlainTextEdit,
                                QTabWidget, QToolBar)
 
 from devices.monochromator import MonochromatorController, SimulationState
 from devices.ocean_hdx import OceanHDXController
+from devices.asi_camera import ASICameraClient
 from gui.characterization_panel import CharacterizationPanel
 from gui.hdx_panel import HDXPanel
 from gui.monochromator_panel import MonochromatorPanel
@@ -47,9 +48,14 @@ QDockWidget::title { background:#21262d; padding:4px; }
 """
 
 
+from gui.workers import _active_tasks
+
+
 class MainWindow(QMainWindow):
-    def __init__(self, base_dir: Path, simulate: bool = False, backend: str = "native"):
+    def __init__(self, base_dir: Path, simulate: bool = False, backend: str = "native",
+                 spectrometer_factory=OceanHDXController, camera_factory=ASICameraClient):
         super().__init__()
+        self._closing = False
         self.setWindowTitle("Spectral Characterization Suite")
         self.resize(1400, 900)
         self.setStyleSheet(STYLE)
@@ -59,7 +65,7 @@ class MainWindow(QMainWindow):
 
         self.sim_state = SimulationState()
         self.mono = MonochromatorController(self.sim_state)
-        self.hdx = OceanHDXController(self.sim_state, backend)
+        self.hdx = spectrometer_factory(self.sim_state, backend)
 
         tb = QToolBar("Main")
         tb.setMovable(False)
@@ -77,10 +83,13 @@ class MainWindow(QMainWindow):
         self.mono_panel = MonochromatorPanel(self.mono, sim)
         self.hdx_panel = HDXPanel(self.hdx, sim, data_dir)
         self.char_panel = CharacterizationPanel(self.mono, self.hdx, data_dir, report_dir, sim)
+        self.char_panel.camera_factory = camera_factory
+        self.char_panel.can_start = lambda: not (_active_tasks or self.hdx_panel._live or
+                                                self.hdx_panel._stopping or self.mono_panel._busy)
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self.mono_panel, "Monochromator")
-        self.tabs.addTab(self.hdx_panel, "Spectrometer (HDX)")
+        self.tabs.addTab(self.hdx_panel, "Spectrometer")
         self.tabs.addTab(self.char_panel, "Characterization")
         self.setCentralWidget(self.tabs)
 
@@ -113,6 +122,7 @@ class MainWindow(QMainWindow):
         self.log_event(f"Simulation mode {'ON' if on else 'OFF'}")
 
     def _update_indicators(self, *_):
+        self.char_panel.int_spin.setRange(self.hdx.MIN_INT_MS, self.hdx.MAX_INT_MS)
         for lbl, dev in ((self.mono_ind, self.mono), (self.hdx_ind, self.hdx)):
             color = "#3fb950" if dev.is_connected else "#f85149"
             if dev.is_connected and dev.is_simulated:
@@ -127,14 +137,22 @@ class MainWindow(QMainWindow):
             self.mono_panel.update_position(self.mono.position_nm)
 
     def closeEvent(self, event):
-        if self.char_panel.worker is not None:
-            if QMessageBox.question(self, "Scan running", "A characterization is running. Abort and quit?") \
-                    != QMessageBox.Yes:
-                event.ignore()
-                return
-            self.char_panel.worker.abort()
-            self.char_panel.worker.wait(10000)
-        self.hdx_panel.stop_live(block=True)
+        busy = (self.char_panel.worker is not None or _active_tasks or
+                self.hdx_panel._live is not None or self.hdx_panel._stopping)
+        if busy:
+            event.ignore()
+            if not self._closing:
+                if self.char_panel.worker is not None and QMessageBox.question(
+                        self, "Scan running", "Abort and close after active device I/O finishes? "
+                        "This does not physically stop the motor.") != QMessageBox.Yes:
+                    return
+                self._closing = True
+                if self.char_panel.worker is not None:
+                    self.char_panel.worker.abort()
+                self.hdx_panel.stop_live()
+                self.setEnabled(False)
+            QTimer.singleShot(100, self.close)
+            return
         self.mono.disconnect()
         self.hdx.disconnect()
         event.accept()

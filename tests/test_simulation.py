@@ -20,6 +20,7 @@ from analysis.spectral_analysis import CSV_COLUMNS, analyze_spectrum, estimate_b
 from devices.monochromator import MonochromatorController, MonochromatorError, SimulationState
 from devices.ocean_hdx import OceanHDXController
 from gui.main_window import MainWindow
+from gui.qt_bootstrap import prepare_qt
 
 
 def wait_until(app, cond, timeout=60.0):
@@ -63,6 +64,7 @@ def test_devices():
 def test_gui():
     QMessageBox.information = lambda *a, **k: None
     QMessageBox.critical = lambda *a, **k: print("CRITICAL", a[1:])
+    prepare_qt()
     app = QApplication.instance() or QApplication(sys.argv)
     tmp = Path(tempfile.mkdtemp())
     (tmp / "data").mkdir()
@@ -81,6 +83,7 @@ def test_gui():
     hp.live_btn.setChecked(True)
     wait_until(app, lambda: hp._last is not None)
     hp.live_btn.setChecked(False)
+    wait_until(app, lambda: not hp._stopping and hp.dark_btn.isEnabled())
     assert "550" in hp.peak_lbl.text(), hp.peak_lbl.text()
 
     # Background (dark): take, check it is subtracted, then invalidate by changing integration
@@ -104,7 +107,7 @@ def test_gui():
     assert len(df) == 81, len(df)
     assert cp.params["dark"] == "measured before scan" and win.hdx.dark_active, cp.params.get("dark")
     assert cp.last_csv and set(CSV_COLUMNS) <= set(pd.read_csv(cp.last_csv).columns)
-    spectra = sorted(cp.run_dir.glob("[0-9]*.npz"))
+    spectra = sorted(cp.run_dir.glob("[0-9]*nm.npz"))
     assert len(spectra) == 81
     with np.load(cp.run_dir / "dark.npz") as dark, np.load(spectra[0]) as first:
         assert dark["raw_scans"].shape == (cp.dark_avg_spin.value(), 2068)

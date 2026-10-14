@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/ioctl.h>
+#include <sys/file.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -39,6 +40,11 @@ void SerialPort::open(const std::string& path, int baudrate) {
   if (fd < 0) {
     throw std::runtime_error("serial open failed: " + path + ": " +
                              std::strerror(errno));
+  }
+
+  if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+    ::close(fd);
+    throw std::runtime_error("serial port already owned: " + path);
   }
 
   // Some USB-CDC adapters (Arduino) report EIO until DTR settles; we clear

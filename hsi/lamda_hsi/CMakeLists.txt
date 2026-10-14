@@ -96,7 +96,7 @@ endif()
 
 # The legacy ImGui app opens the monochromator serial port itself: never run it during a
 # coordinated scan. -DLAMDA_HSI_BUILD_GUI=OFF builds only asi_camd (no network fetch).
-option(LAMDA_HSI_BUILD_GUI "Build the legacy lamda_hsi ImGui application" ON)
+option(LAMDA_HSI_BUILD_GUI "Build the legacy lamda_hsi ImGui application" OFF)
 if(LAMDA_HSI_BUILD_GUI)
 
 # -----------------------------------------------------------------------------

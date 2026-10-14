@@ -16,6 +16,8 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <filesystem>
+#include <fcntl.h>
 #include <cstdlib>
 #include <iostream>
 #include <pthread.h>
@@ -70,7 +72,7 @@ void writeNpy(const std::string& path, const std::vector<std::uint8_t>& data, in
   header.append((64 - total % 64) % 64, ' ');
   header += '\n';
   const std::string tmp = path + ".tmp";
-  FILE* f = std::fopen(tmp.c_str(), "wb");
+  FILE* f = std::fopen(tmp.c_str(), "wbx");
   if (!f) throw std::runtime_error("cannot open " + tmp);
   const unsigned short hlen = static_cast<unsigned short>(header.size());
   const unsigned char preamble[10] = {0x93, 'N', 'U', 'M', 'P', 'Y', 1, 0,
@@ -81,10 +83,17 @@ void writeNpy(const std::string& path, const std::vector<std::uint8_t>& data, in
             std::fwrite(data.data(), 1, data.size(), f) == data.size() &&
             std::fflush(f) == 0 && fsync(fileno(f)) == 0;
   ok = (std::fclose(f) == 0) && ok;
-  if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) {
+  if (!ok || ::link(tmp.c_str(), path.c_str()) != 0) {
     std::remove(tmp.c_str());
     throw std::runtime_error("write failed: " + path);
   }
+  std::remove(tmp.c_str());
+  const auto parent = std::filesystem::path(path).parent_path();
+  int dir = ::open(parent.empty() ? "." : parent.c_str(), O_RDONLY);
+  if (dir < 0) throw std::runtime_error("cannot sync frame directory");
+  const int synced = fsync(dir);
+  ::close(dir);
+  if (synced != 0) throw std::runtime_error("cannot sync frame directory");
 }
 
 std::string configure(mc::Camera& cam, std::istringstream& args) {
@@ -95,6 +104,8 @@ std::string configure(mc::Camera& cam, std::istringstream& args) {
   if (bin < 1 || expUs < 1 || x < 0 || y < 0 || w < 0 || h < 0)
     throw std::runtime_error("CONFIG values out of range");
   const auto& info = cam.info();
+  if (info.IsColorCam == ASI_TRUE)
+    throw std::runtime_error("Quantitative acquisition requires a monochrome RAW16 camera");
   if (w == 0) w = (static_cast<int>(info.MaxWidth) / bin) & ~7;   // ASI: width % 8 == 0
   if (h == 0) h = (static_cast<int>(info.MaxHeight) / bin) & ~1;  // ASI: height % 2 == 0
   cam.setRoi({w, h, bin, ASI_IMG_RAW16});
@@ -119,6 +130,7 @@ std::string expose(mc::Camera& cam, const std::string& path) {
   const mc::RoiFormat r = cam.getRoi();
   if (r.imageType != ASI_IMG_RAW16) throw std::runtime_error("CONFIG first (RAW16 required)");
   std::vector<std::uint8_t> buf(cam.frameBytes());
+  if (g_abort) throw std::runtime_error("aborted");
   cam.startExposure(false);
   for (;;) {
     if (g_abort) {
@@ -170,11 +182,18 @@ int main(int argc, char** argv) {
     return 1;
   }
   const auto& info = cam->info();
+  if (info.BitDepth < 1 || info.BitDepth > 16) {
+    reply("ERROR unsupported ADC bit depth");
+    return 1;
+  }
+  const unsigned rawMaximum = ((1u << info.BitDepth) - 1u) << (16 - info.BitDepth);
   std::ostringstream ready;
-  ready << "{\"model\": \"" << jsonEscape(info.Name) << "\", \"serial\": \""
+  ready << "{\"protocol_version\": 2, \"model\": \"" << jsonEscape(info.Name) << "\", \"serial\": \""
         << jsonEscape(cam->serialNumber().value_or("")) << "\", \"sdk\": \""
         << jsonEscape(mc::CameraManager::sdkVersion()) << "\", \"max_width\": " << info.MaxWidth
         << ", \"max_height\": " << info.MaxHeight << ", \"bit_depth\": " << info.BitDepth
+        << ", \"max_intensity\": " << rawMaximum
+        << ", \"raw16_alignment\": \"msb\""
         << ", \"pixel_um\": " << info.PixelSize << "}";
   reply("READY " + ready.str());
 

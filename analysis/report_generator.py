@@ -40,6 +40,8 @@ def generate_report(path: str | Path, params: dict, summary: dict,
                     device_info: dict | None = None) -> Path:
     """plot_images: list of (title, png_path)."""
     path = Path(path)
+    if path.suffix.lower() != ".pdf":
+        raise ValueError("Report requires a .pdf path")
     path.parent.mkdir(parents=True, exist_ok=True)
     styles = getSampleStyleSheet()
     h1 = ParagraphStyle("h1", parent=styles["Title"], fontSize=20, spaceAfter=4)
@@ -55,14 +57,14 @@ def generate_report(path: str | Path, params: dict, summary: dict,
     rows = [["Parameter", "Value"],
             ["Range", f"{params['start']:g}-{params['stop']:g} nm"],
             ["Step", f"{params['step']:g} nm"],
-            ["Averages per point", str(params["averages"])],
-            ["Integration time", f"{params['integration_ms']:g} ms"],
+            ["Averages per point", str(params.get("averages") or "unknown")],
+            ["Integration time", _fmt(params.get("integration_ms"), "ms")],
             ["Entrance slit", f"{params['entrance_slit_um']:g} µm" if params.get("entrance_slit_um") else "not recorded"],
             ["Exit slit", f"{params['exit_slit_um']:g} µm" if params.get("exit_slit_um") else "not recorded"],
-            ["Settling time", f"{params.get('settle_s', 0):g} s"],
+            ["Settling time", _fmt(params.get("settle_s"), "s")],
             ["Backward scan", "Yes" if params.get("backward") else "No"],
             ["Background (dark) correction", str(params.get("dark", "none"))],
-            ["Mode", "Simulation" if params.get("simulation") else "Hardware"]]
+            ["Mode", "unknown" if params.get("simulation") is None else "Simulation" if params["simulation"] else "Hardware"]]
     for k, v in (device_info or {}).items():
         rows.append([k, v])
     if csv_path:

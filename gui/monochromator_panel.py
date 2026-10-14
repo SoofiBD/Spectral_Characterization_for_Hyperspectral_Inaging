@@ -27,6 +27,7 @@ class MonochromatorPanel(QWidget):
         self._busy = False
         self.ctrl.traffic_callback = lambda d, t: self.traffic.emit(d, t)
         self.traffic.connect(self._on_traffic)
+        self._external_busy = False
         self._build_ui()
         self.refresh_ports()
         self._update_state()
@@ -155,12 +156,13 @@ class MonochromatorPanel(QWidget):
     def _update_state(self):
         c = self.ctrl.is_connected
         self.connect_btn.setText("Disconnect" if c else "Connect")
-        self.port_combo.setEnabled(not c)
+        self.connect_btn.setEnabled(not self._busy and not self._external_busy)
+        self.port_combo.setEnabled(not c and not self._external_busy)
         self.baud_combo.setEnabled(not c)
         self.refresh_btn.setEnabled(not c)
         for w in (self.goto_btn, self.home_btn, self.reset_btn, self.set_btn, self.pos_btn, self.status_btn,
                   self.send_btn, self.cmd_edit):
-            w.setEnabled(c and not self._busy)
+            w.setEnabled(c and not self._busy and not self._external_busy)
         if not c:
             self._set_status("DISCONNECTED", bad=True)
             self.pos_lbl.setText("— nm")
@@ -173,7 +175,7 @@ class MonochromatorPanel(QWidget):
 
     def set_external_busy(self, busy: bool):
         """Lock manual controls while an automated scan owns the device."""
-        self._busy = busy
+        self._external_busy = busy
         self._update_state()
 
     def update_position(self, nm: float | None):
@@ -208,7 +210,7 @@ class MonochromatorPanel(QWidget):
 
         run_task(self.ctrl.connect, port, simulate, baudrate=int(self.baud_combo.currentText()),
                  on_result=done, on_error=fail,
-                 on_finished=lambda: self.connect_btn.setEnabled(True))
+                 on_finished=self._update_state)
 
     def _run(self, label: str, fn, *args):
         self._busy = True

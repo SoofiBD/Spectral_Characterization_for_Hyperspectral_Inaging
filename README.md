@@ -55,20 +55,35 @@ In the monochromator port list, the `SIMULATED` entry always picks the fake devi
 1. **Monochromator tab:** pick the COM port and click Connect. From here you can send GOTO, HOME,
    RESET, POS and STATUS, type manual commands, and see the command history and the timestamped
    device traffic (`>>` sent, `<<` received, errors in red).
-2. **Spectrometer (HDX) tab:** click Connect and set the integration time. Use Acquire for a single
-   spectrum or Start Live for a continuous one. A live line analysis shows the peak, FWHM and SNR.
+2. **Spectrometer (HDX) tab:** click Connect and set the integration time and exposure count.
+   Acquire saves every raw exposure and the aggregate automatically under `data/hdx_measurement_<timestamp>/`.
+   The analysis target does not move the monochromator; it only selects the peak-search window.
+   Take Dark saves every dark exposure and its mean under `data/hdx_dark_<timestamp>/`.
+   Open Measurement reloads verified data; Load Saved Dark restores a verified reference only for
+   the same device, simulation/hardware mode, integration time and wavelength axis.
+   Open Saved Folder opens the current recording directory. Save Spectrum exports the displayed
+   spectrum as CSV; Start Live is a preview and does not automatically record frames.
+   A live line analysis shows the peak, FWHM and SNR.
 3. **Characterization tab:** set start, stop, step, averages, integration time, settling time and an
    optional backward scan, then click Start. Each point runs `GOTO:<nm>`, waits for `OK:DONE`,
    acquires and averages N spectra, then analyzes them. Plots and the table update live, and you can
-   abort at any time.
-   * Optional **Camera (ZWO ASI, RAW16)** box: each point also takes one camera exposure after
+   abort at any time. Abort prevents subsequent work; an active monochromator move is allowed to finish
+   because the firmware has no supported motor-stop command.
+   Equal start and stop values acquire one wavelength using the same raw-recording workflow.
+   The parameter box shows the number of positions, HDX exposures and the first move (pre-positioning
+   to start − 2 steps); the Output box shows the saved folder and has Open Saved Folder.
+   With real hardware every Start asks the operator to confirm that the Arduino-reported position
+   matches the physical counter (unknown position: use POS first; SET defines it without motion,
+   HOME and RESET move). Nothing is created or moved on No; the confirmation is stored as
+   `parameters.position_check` in `manifest.json`. Simulation skips this check.
+   * Optional **Camera (monochrome RAW16)** box: each point also takes one camera exposure after
      the HDX spectra. The background step then also takes a camera dark frame.
    * Each scan creates `data/run_<timestamp>/`. `summary.csv` contains derived results;
      `dark.npz` and one numbered `.npz` per scan point preserve the full HDX wavelength axis
      and every uncorrected exposure; `camera_dark.npy` and one numbered `.npy` per point hold the
      untouched RAW16 camera frames. `manifest.json` (see below) records settings, devices,
-     timestamps and the SHA-256 of every raw file. Each point is written and recorded before
-     the next move, so completed points survive an aborted or crashed scan.
+     timestamps and the SHA-256 of every raw file. Every HDX exposure is written and recorded immediately, followed by the per-point aggregate
+     and camera frame. Completed and partial points survive interruption; raw paths cannot be overwritten.
    * **Export ENVI Cube** writes `data/run_<timestamp>_envi/cube.hdr|raw|json` (float32 BSQ,
      forward points, camera dark subtracted) from the verified raw frames.
    * **Generate PDF Report** writes `reports/spectral_report_<timestamp>.pdf`, with the plot PNGs in
@@ -79,18 +94,18 @@ In the monochromator port list, the `SIMULATED` entry always picks the fake devi
 `acquisition/coordinator.py` is the only code that moves the monochromator during a scan.
 Per point: `GOTO` → `OK:DONE:<pos>` within the move timeout → reported position must be within
 0.5 nm of the target → settle → HDX raw exposures → camera RAW16 frame → files written and hashed →
-`manifest.json` updated. States: Preparing → Moving → Settling → Acquiring → Saving → Complete,
+`manifest.json` updated. Both device locks are held throughout the scan; pending manual/live work blocks startup. States: Preparing → Moving → Settling → Acquiring → Saving → Complete,
 or Stopping → Aborted / Failed. Abort cancels a running camera exposure; points already recorded
 are kept.
 
-`manifest.json` (`format_version` 2) is rewritten atomically after each point. It holds `status`
+`manifest.json` (`format_version` 3; version 2 remains readable) is rewritten atomically after each exposure and point update. It holds `status`
 (`running` while a scan is in progress; a `running` manifest that is left behind means the run was
 interrupted), parameters, device identity (port, HDX model/serial, camera model/serial/SDK),
 applied camera settings (exposure, gain, offset, bin, ROI, format, temperature), references
 (`hdx_dark`, `camera_dark` with their settings) and one entry per point (target/reported
 wavelength, UTC times, file names, sizes, SHA-256). `acquisition.session.load_verified(dir)`
 re-checks every file and returns only the points that verify. Nothing resumes automatically.
-White (flat) references are not taken by the scan.
+Optional white-reference runs can be acquired separately and selected for camera ENVI correction or separate white-normalized spectrometer exports. See [validation and calibration](docs/VALIDATION.md).
 
 ## Camera process (asi_camd)
 The ASI SDK runs in a separate C++ process, `hsi/lamda_hsi/build/asi_camd`, which writes frames
@@ -159,7 +174,9 @@ tests/test_simulation.py      headless end-to-end test
 tests/test_scan.py            coordinator: timeout, position, abort, recovery, calibration
 ```
 
-All hardware I/O runs in worker threads, so the GUI never blocks. Both controllers are guarded by locks.
+Scan hardware I/O runs in a worker thread. Both controllers are guarded by locks held for the entire scan.
+Shutdown waits asynchronously for active work rather than destroying a running worker. Mixed simulated/real
+devices are rejected before camera initialization.
 
 ## Testing
 ```bash
@@ -169,3 +186,33 @@ This test checks every device command and error handling, live acquisition, a fu
 forward/backward scan, the CSV export, the PDF report, and a short camera scan with ENVI export.
 `python tests/test_scan.py` covers move timeout, position mismatch, abort during an exposure,
 interrupted/corrupted session recovery, mismatched camera dark and manifest path escape.
+
+
+## Device selection, recovery and validation
+
+The Spectrometer tab selects native HDX or either seabreeze backend and an optional serial number.
+Non-HDX Ocean devices use the integration limits and saturation level reported by their driver.
+The camera panel selects index, exposure/gain/offset/binning and ROI; SDK validation remains authoritative.
+Other manufacturers can supply a local driver without changing acquisition logic. See
+[driver contracts and supported devices](docs/DRIVERS.md). An unknown USB device still needs a driver.
+
+**Open run / recover** reloads a verified manifest and reanalyzes its complete points. Partial points,
+missing references, checksum errors and unrecorded files are reported; originals are never rewritten.
+**Load CSV** uses adjacent manifest/legacy run metadata, or reports unrecorded settings as unknown.
+It does not substitute current device identities or GUI settings into historical reports.
+
+For dark/white correction, temperature limits, all test commands, and the remaining physical-device
+acceptance work, read [validation and operational limits](docs/VALIDATION.md). The software tests cannot
+replace lab validation. The October 7 measurements are protected by a versioned review-baseline checksum
+inventory; no claim is made about an unavailable pre-review backup.
+
+## Saved validation results (14 October 2026)
+
+`reports/validation_20261014/HSI_Test_ve_Dogrulama_2026-10-14.pdf` combines the actual HDX measurements,
+the final local software-test results, cleanup details and remaining hardware-validation limits.
+The same directory contains all seven test logs, JSON results, source/measurement checksums,
+the measurement plot and Claude's review/fix records. Final software tests used simulated or fake devices only.
+
+Completed patch/backup outputs and generated caches were moved outside the project into the Desktop
+`HSI_arsiv_20261014_113118/` archive; `cleanup_manifest.json` records the original paths and SHA-256 values.
+Source code, tests, SDKs, the virtual environment and all measurement data were retained.

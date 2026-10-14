@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import threading
 import time
 
@@ -74,6 +75,8 @@ def select_backend(name: str = "pyseabreeze") -> str:
     """
     global _backend_selected
     if _backend_selected is not None:
+        if name != _backend_selected:
+            raise SpectrometerError("Restart the application before switching seabreeze backends")
         return _backend_selected
     import seabreeze
     seabreeze.use(name)
@@ -187,6 +190,8 @@ class OceanHDXController:
         self._wavelengths: np.ndarray | None = None
         self.integration_time_ms = 100.0
         self.correct_dark = False
+        self.max_intensity = 65535.0
+        self.dark_captured_utc = None
         # Background (dark) spectrum, valid only for the integration time it was taken at
         self.dark: np.ndarray | None = None
         self.dark_scans: list[np.ndarray] = []
@@ -241,8 +246,21 @@ class OceanHDXController:
                     raise SpectrometerError(f"No Ocean spectrometer found: {exc}") from exc
                 # Seabreeze wraps the HDX in a different class; dark correction support varies
                 self.correct_dark = False
-            self._wavelengths = np.asarray(self._spec.wavelengths(), dtype=float)
-            self.set_integration_time(self.integration_time_ms)
+            try:
+                self._wavelengths = np.asarray(self._spec.wavelengths(), dtype=float)
+                if self._wavelengths.ndim != 1 or self._wavelengths.size < 2 or not np.all(np.isfinite(self._wavelengths)):
+                    raise SpectrometerError("Invalid spectrometer wavelength calibration")
+                if simulate or self.backend == "native":
+                    self.MIN_INT_MS, self.MAX_INT_MS = 6.0, 10000.0
+                    self.max_intensity = 65535.0
+                else:
+                    limits = self._spec.integration_time_micros_limits
+                    self.MIN_INT_MS, self.MAX_INT_MS = (float(v) / 1000 for v in limits)
+                    self.max_intensity = float(self._spec.max_intensity)
+                self.set_integration_time(min(self.MAX_INT_MS, max(self.MIN_INT_MS, self.integration_time_ms)))
+            except Exception:
+                self.disconnect()
+                raise
 
     def disconnect(self):
         with self._lock:
@@ -258,12 +276,12 @@ class OceanHDXController:
             raise SpectrometerError(f"Integration time {ms} ms out of range "
                                     f"({self.MIN_INT_MS}-{self.MAX_INT_MS} ms)")
         with self._lock:
-            self.integration_time_ms = float(ms)
             if self._spec is not None:
                 try:
                     self._spec.integration_time_micros(int(round(ms * 1000)))
                 except Exception as exc:
                     raise SpectrometerError(f"Failed to set integration time: {exc}") from exc
+            self.integration_time_ms = round(ms * 1000) / 1000
 
     @property
     def dark_valid(self) -> bool:
@@ -282,7 +300,7 @@ class OceanHDXController:
                 raise SpectrometerError("Spectrometer not connected")
             try:
                 intensities = np.asarray(
-                    self._spec.intensities(correct_dark_counts=self.correct_dark), dtype=float)
+                    self._spec.intensities(correct_dark_counts=False, correct_nonlinearity=False), dtype=float)
             except Exception as exc:
                 raise SpectrometerError(f"Acquisition failed: {exc}") from exc
             return self._wavelengths.copy(), intensities
@@ -302,6 +320,7 @@ class OceanHDXController:
             self.dark_scans = scans
             self.dark = np.mean(scans, axis=0)
             self.dark_integration_ms = self.integration_time_ms
+            self.dark_captured_utc = dt.datetime.now(dt.timezone.utc).isoformat()
             return self.dark.copy()
 
     def clear_dark(self):
@@ -309,6 +328,7 @@ class OceanHDXController:
             self.dark = None
             self.dark_scans = []
             self.dark_integration_ms = None
+            self.dark_captured_utc = None
 
     def acquire_averaged(self, n: int) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
         """Average n scans. Also returns individual scans for repeatability analysis."""
