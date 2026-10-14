@@ -1,5 +1,8 @@
 name: Simulation and driver checks
 on: [push, pull_request]
+
+permissions:
+  contents: read
 jobs:
   simulation:
     runs-on: ubuntu-latest
@@ -12,8 +15,14 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
+      - name: Install headless Qt runtime dependencies
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0
       - run: pip install -r requirements.txt
       - run: python tests/test_scan.py
+      - run: python tests/test_scan_preflight.py
+      - run: python tests/test_hdx_recording.py
       - run: python tests/test_simulation.py
       - run: python tests/test_gui_safety.py
       - run: python tests/test_camd.py
+      - name: Check private legacy data when available
+        run: python tests/test_legacy_data.py

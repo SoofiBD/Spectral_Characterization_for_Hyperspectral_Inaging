@@ -4,6 +4,8 @@
 
 ```sh
 .venv/bin/python tests/test_scan.py
+QT_QPA_PLATFORM=offscreen .venv/bin/python tests/test_scan_preflight.py
+QT_QPA_PLATFORM=offscreen .venv/bin/python tests/test_hdx_recording.py
 QT_QPA_PLATFORM=offscreen .venv/bin/python tests/test_simulation.py
 QT_QPA_PLATFORM=offscreen .venv/bin/python tests/test_gui_safety.py
 .venv/bin/python tests/test_camd.py

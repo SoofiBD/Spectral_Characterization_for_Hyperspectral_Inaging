@@ -11,7 +11,7 @@ build-*/
 *.obj
 compile_commands.json
 
-# Measurements and generated output (re-measure / regenerate)
+# Private measurements and generated output (kept locally)
 data/
 reports/
 captures/
@@ -25,3 +25,14 @@ hsi/lamda_hsi/ASI_linux_mac_SDK_V1.41/lib/
 .vscode/
 .idea/
 .DS_Store
+
+# Local credentials and task outputs
+.env
+.env.*
+!.env.example
+/outputs/
+/artifacts/
+*.log
+*.tmp
+*.bak
+*~
