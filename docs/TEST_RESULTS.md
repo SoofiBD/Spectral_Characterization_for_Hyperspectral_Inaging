@@ -1,6 +1,23 @@
 # Test results - 14 October 2026
 
-## Latest local run
+## Camera-first update (14 October 2026, Linux only)
+
+Environment: Linux cloud sandbox, Python 3.13, PySide6 6.12, offscreen Qt; simulated camera process
+(`sim_camd.py`), simulated Arduino/HDX and the test-only ASI SDK. **Not yet run on macOS and not with a
+real camera, monochromator or HDX.** Private legacy files were not present there (skip); on the Mac
+their 91 hashes were checked separately and match.
+
+| Test | Result |
+| --- | --- |
+| `test_scan.py` (incl. camera-only coordinator, real-mode dark prompts with fakes) | Passed |
+| `test_scan_preflight.py` (incl. camera-only position check before handover) | Passed |
+| `test_hdx_recording.py` | Passed |
+| `test_simulation.py` (HDX-only and HDX + camera) | Passed |
+| `test_gui_safety.py` | Passed |
+| `test_camera.py` (Camera tab, handover, camera + Arduino without HDX, abort, loss, close) | Passed |
+| `test_camd.py` (incl. preview loop and stationary frame on the C++ daemon) | Passed |
+
+## Latest local run (before the camera-first update)
 
 Environment: macOS on Apple Silicon, project Python 3.12 environment. Qt tests used the offscreen
 platform; acquisition used simulated or fake devices only. Tests ran in groups of up to three.

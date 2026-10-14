@@ -12,7 +12,7 @@ import gui.characterization_panel as panel_module
 class Fake:
     """Device stand-in: any attribute beyond the listed state (a command) fails the test."""
     def __init__(self, simulated, **state):
-        self.__dict__.update(is_connected=True, is_simulated=simulated, calls=[], **state)
+        self.__dict__.update({"is_connected": True, "is_simulated": simulated, "calls": [], **state})
 
     def __getattr__(self, name):
         self.calls.append(name)
@@ -27,8 +27,8 @@ class Sig:
 class FakeWorker:
     created = []
 
-    def __init__(self, mono, hdx, params, run_dir, parent=None, camera_factory=None):
-        self.params, self.run_dir = params, run_dir
+    def __init__(self, mono, hdx, params, run_dir, parent=None, camera_factory=None, camera_handover=None):
+        self.params, self.run_dir, self.hdx, self.camera_handover = params, run_dir, hdx, camera_handover
         for name in ("point_done", "status", "progress", "failed", "ask_user", "finished"):
             setattr(self, name, Sig())
         FakeWorker.created.append(self)
@@ -50,6 +50,8 @@ def main():
         mono = Fake(False, port="FAKE", position_nm=None)
         hdx = Fake(False, device_info={"model": "fake"})
         cp = panel_module.CharacterizationPanel(mono, hdx, data, data / "reports", lambda: False)
+        cp.cam_box.setChecked(False)  # HDX-only plan and preflight; camera plans are in test_camera.py
+        cp.hdx_box.setChecked(True)
         cp.start_spin.setValue(400); cp.stop_spin.setValue(800); cp.step_spin.setValue(10); cp.avg_spin.setValue(5)
         cp.bwd_chk.setChecked(False)
         assert cp.scan_summary() == (41, 205, 380) and "41 positions, 205 HDX" in cp.plan_lbl.text()
@@ -82,6 +84,8 @@ def main():
 
         sim = panel_module.CharacterizationPanel(Fake(True, port="SIM", position_nm=None),
                                                  Fake(True, device_info={}), data / "sim", data, lambda: True)
+        sim.cam_box.setChecked(False)
+        sim.hdx_box.setChecked(True)
         sim.start()
         assert len(prompts) == 3 and FakeWorker.created[-1].params["position_check"]["mode"] == "simulation"
 
@@ -107,6 +111,31 @@ def main():
         worker.run()  # fails at the coordinator's first device access (lock), after subtract was forced on
         assert failures and "_lock" in failures[0] and mono_state.calls == ["_lock"] and not hdx_state.calls
         assert hdx_state.subtract_dark is False
+
+        # Camera-only hardware scan (no HDX connected): the position check comes before the live
+        # preview is stopped/handed over; cancelling leaves the Camera tab untouched.
+        class FakeCameraPanel:
+            handovers = 0
+            def scan_settings(self):
+                return dict(index=0, exposure_us=1000, gain=0, offset=0, bin=1, roi=[0, 0, 0, 0], simulate=False)
+            def begin_scan_handover(self):
+                FakeCameraPanel.handovers += 1
+                return "handover"
+        cam_dir = data / "camera"
+        mono_cam = Fake(False, port="FAKE", position_nm=480.0)
+        cam_panel = panel_module.CharacterizationPanel(mono_cam, Fake(False, is_connected=False), cam_dir, data,
+                                                       lambda: False)
+        cam_panel.camera_panel = FakeCameraPanel()
+        created = len(FakeWorker.created)
+        answer[0] = QMessageBox.No
+        cam_panel.start()
+        assert FakeCameraPanel.handovers == 0 and len(FakeWorker.created) == created and not cam_dir.exists()
+        answer[0] = QMessageBox.Yes
+        cam_panel.start()
+        worker = FakeWorker.created[-1]
+        assert FakeCameraPanel.handovers == 1 and worker.camera_handover == "handover" and worker.hdx is None
+        assert worker.params["hdx"] is False and worker.params["averages"] is None
+        assert worker.params["position_check"]["reported_nm"] == 480.0 and not mono_cam.calls
     assert len(warnings) == 2, warnings
     print("ALL SCAN PREFLIGHT TESTS PASSED")
 

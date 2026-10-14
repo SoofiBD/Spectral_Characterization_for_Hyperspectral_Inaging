@@ -49,6 +49,16 @@ def with_camera(root):
         except FileExistsError:
             pass
         assert (root/'raw.npy').read_bytes()==before
+        from acquisition.camera_measurement import record_camera_frame
+        for i in range(3):  # live-preview pattern on the real daemon: expose -> load -> delete
+            preview=root/f'preview_{i}.npy'
+            cam.expose(preview)
+            assert np.load(preview).shape==(32,64)
+            preview.unlink()
+        assert not list(root.glob('preview_*'))
+        session=record_camera_frame(cam,root/'frame_session')
+        rec=session.manifest['points'][0]['camera']
+        assert session.manifest['status']=='complete' and rec['dtype']=='uint16' and rec['shape']==[32,64]
     finally:
         cam.close()
     for hang in (False,True):

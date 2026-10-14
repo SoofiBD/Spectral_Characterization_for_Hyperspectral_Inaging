@@ -37,6 +37,8 @@ def main():
         root = Path(tmp)
         win = MainWindow(root, simulate=True)
         hp, cp = win.hdx_panel, win.char_panel
+        cp.cam_box.setChecked(False)  # this test covers the optional HDX channel alone
+        cp.hdx_box.setChecked(True)
         win.hdx.connect(simulate=True)
         hp._update_state()
         hp.int_spin.setValue(100)

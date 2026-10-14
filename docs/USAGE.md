@@ -52,10 +52,26 @@ You can also switch **Simulation Mode** in the toolbar. The change takes effect 
 In the monochromator port list, the `SIMULATED` entry always picks the fake device.
 
 ## Workflow
+The camera is the primary device and the HDX is optional. Tabs: **Camera**, **Monochromator**,
+**HSI Scan**, **HDX (optional)**.
+
+0. **Camera tab** (works alone; HDX and Arduino are not needed): choose *Real camera (asi_camd)* or
+   *Simulated camera* (follows the toolbar Simulation Mode while disconnected) and the camera index, click
+   **Connect** (identity: model, serial, SDK, sensor size, bit depth, pixel size). Set exposure, gain,
+   offset, binning and ROI and click **Apply Settings**; the label shows the values the camera SDK
+   actually applied (the SDK decides limits and alignment). **Start Live** shows a real-time grayscale
+   view: the preview thread exposes into a temporary folder (`<system temp>/hsi_camera_preview_*`),
+   loads the frame and deletes the file at once; only the newest frame is drawn, so memory and disk use
+   do not grow. Auto contrast and levels are display only; the RAW16 data is never modified.
+   **Stop Live** returns immediately; the current exposure finishes in the background (closing the
+   window aborts it). **Save Raw Frame** is the only way the tab writes data: the next RAW16 frame goes
+   to `data/camera_frame_<timestamp>/` (`frame_0000.npy` + `manifest.json` with device identity,
+   applied settings, UTC times, shape, dtype, size and SHA-256). Disconnect removes the preview folder.
+   If the camera process ends (USB unplugged, driver crash, abort), the tab releases it and asks to reconnect.
 1. **Monochromator tab:** pick the COM port and click Connect. From here you can send GOTO, HOME,
    RESET, SET, POS and STATUS, type manual commands, and see the command history and the timestamped
    device traffic (`>>` sent, `<<` received, errors in red).
-2. **Spectrometer (HDX) tab:** click Connect and set the integration time and exposure count.
+2. **HDX (optional) tab:** click Connect and set the integration time and exposure count.
    Acquire saves every raw exposure and the aggregate automatically under `data/hdx_measurement_<timestamp>/`.
    The analysis target does not move the monochromator; it only selects the peak-search window.
    Take Dark saves every dark exposure and its mean under `data/hdx_dark_<timestamp>/`.
@@ -64,9 +80,16 @@ In the monochromator port list, the `SIMULATED` entry always picks the fake devi
    Open Saved Folder opens the current recording directory. Save Spectrum exports the displayed
    spectrum as CSV; Start Live is a preview and does not automatically record frames.
    A live line analysis shows the peak, FWHM and SNR.
-3. **Characterization tab:** set start, stop, step, averages, integration time, settling time and an
-   optional backward scan, then click Start. Each point runs `GOTO:<nm>`, waits for `OK:DONE`,
-   acquires and averages N spectra, then analyzes them. Plots and the table update live, and you can
+3. **HSI Scan tab:** select the channels: **Camera — primary** (default; uses the Camera tab
+   settings) and/or **HDX spectrometer (optional)** (averages, integration, HDX dark averages). The
+   monochromator must be connected (the scan moves it); the HDX only when its box is ticked. Set start,
+   stop, step, settling time and an optional backward scan, then click Start. If the Camera tab is
+   connected, Start stops its live view, the scan waits until the last preview exposure has finished and
+   then uses the same camera process (one owner at a time); otherwise the scan opens its own camera
+   process and closes it afterwards. Each point runs `GOTO:<nm>`, waits for `OK:DONE`, takes the
+   optional HDX spectra and then one camera frame. Without the HDX no spectra, peaks, FWHM or SNR are
+   produced: the table shows the camera mean counts and saturated pixels, and the PDF report and
+   white-normalized spectra (HDX features) are disabled; ENVI export and Open run work. Plots and the table update live, and you can
    abort at any time. Abort prevents subsequent work; an active monochromator move is allowed to finish
    because the firmware has no supported motor-stop command.
    Equal start and stop values acquire one wavelength using the same raw-recording workflow.
@@ -76,8 +99,9 @@ In the monochromator port list, the `SIMULATED` entry always picks the fake devi
    matches the physical counter (unknown position: use POS first; SET defines it without motion,
    HOME and RESET move). Nothing is created or moved on No; the confirmation is stored as
    `parameters.position_check` in `manifest.json`. Simulation skips this check.
-   * Optional **Camera (monochrome RAW16)** box: each point also takes one camera exposure after
-     the HDX spectra. The background step then also takes a camera dark frame.
+   * **Measure background (dark) first** asks once (real hardware) to block the light, then takes one
+     camera dark frame and, only if the HDX is selected, the HDX dark exposures. They are separate
+     references (`camera_dark`, `hdx_dark`); no HDX dark is requested or recorded without the HDX.
    * Each scan creates `data/run_<timestamp>/`. `summary.csv` contains derived results;
      `dark.npz` and one numbered `.npz` per scan point preserve the full HDX wavelength axis
      and every uncorrected exposure; `camera_dark.npy` and one numbered `.npy` per point hold the
@@ -93,8 +117,10 @@ In the monochromator port list, the `SIMULATED` entry always picks the fake devi
 ## Scan sequence and session manifest
 `acquisition/coordinator.py` is the only code that moves the monochromator during a scan.
 Per point: `GOTO` → `OK:DONE:<pos>` within the move timeout → reported position must be within
-0.5 nm of the target → settle → HDX raw exposures → camera RAW16 frame → files written and hashed →
-`manifest.json` updated. Both device locks are held throughout the scan; pending manual/live work blocks startup. States: Preparing → Moving → Settling → Acquiring → Saving → Complete,
+0.5 nm of the target → settle → optional HDX raw exposures → camera RAW16 frame → files written and
+hashed → `manifest.json` updated. `manifest.channels` lists the channels used (`camera`, `hdx`); the
+spectrometer appears under `devices` only when it was used. The monochromator (and HDX) locks are held
+throughout the scan; pending manual/live work blocks startup. States: Preparing → Moving → Settling → Acquiring → Saving → Complete,
 or Stopping → Aborted / Failed. Abort cancels a running camera exposure; points already recorded
 are kept.
 
@@ -109,7 +135,8 @@ Optional white-reference runs can be acquired separately and selected for camera
 
 ## Camera process (asi_camd)
 The ASI SDK runs in a separate C++ process, `hsi/lamda_hsi/build/asi_camd`, which writes frames
-directly into the session folder. Build it once (macOS needs `brew install libusb pkg-config cmake`):
+directly into the session folder (or the preview temp folder). One process is the only owner of the
+camera: the Camera tab's live view and a scan never use it at the same time. Build it once (macOS needs `brew install libusb pkg-config cmake`):
 ```bash
 cmake -S hsi/lamda_hsi -B hsi/lamda_hsi/build -DLAMDA_HSI_BUILD_GUI=OFF
 cmake --build hsi/lamda_hsi/build --target asi_camd
@@ -159,7 +186,9 @@ devices/monochromator.py      MonochromatorController + simulated serial device
 devices/ocean_hdx.py          OceanHDXController (seabreeze) + simulated HDX
 gui/main_window.py            main window, toolbar, event log, theme
 gui/monochromator_panel.py    serial control UI
-gui/hdx_panel.py              spectrometer UI + live plot
+gui/camera_panel.py           camera UI: connect, live RAW16 view, settings, raw frame recording
+gui/hdx_panel.py              optional HDX spectrometer UI + live plot
+acquisition/camera_measurement.py RAW16 frame checks + stationary camera frame recording
 acquisition/hdx_measurement.py stationary raw/dark recording
 gui/characterization_panel.py automated scan worker, result plots, export
 gui/workers.py                thread-pool / QThread helpers
@@ -185,16 +214,19 @@ See [validation commands and limits](VALIDATION.md) for all test commands.
 
 ```bash
 QT_QPA_PLATFORM=offscreen python tests/test_simulation.py
+QT_QPA_PLATFORM=offscreen python tests/test_camera.py
 ```
 This test checks every device command and error handling, live acquisition, a full 400–800 nm
-forward/backward scan, the CSV export, the PDF report, and a short camera scan with ENVI export.
+forward/backward scan, the CSV export, the PDF report, and a short HDX + camera scan with ENVI export.
+`tests/test_camera.py` covers the camera-first workflow (Camera tab alone, camera + Arduino scans
+without HDX, preview/scan handover, abort, device loss and shutdown) with the simulated camera.
 `python tests/test_scan.py` covers move timeout, position mismatch, abort during an exposure,
 interrupted/corrupted session recovery, mismatched camera dark and manifest path escape.
 
 
 ## Device selection, recovery and validation
 
-The Spectrometer tab selects native HDX or either seabreeze backend and an optional serial number.
+The HDX (optional) tab selects native HDX or either seabreeze backend and an optional serial number.
 Non-HDX Ocean devices use the integration limits and saturation level reported by their driver.
 The camera panel selects index, exposure/gain/offset/binning and ROI; SDK validation remains authoritative.
 Other manufacturers can supply a local driver without changing acquisition logic. See

@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDoub
 from acquisition.coordinator import ScanCoordinator, State, scan_plan
 from analysis.cube_export import export_envi
 from analysis.white_export import export_white_spectra
-from analysis.session_analysis import analyze_raw, load_results
+from analysis.session_analysis import analyze_raw, camera_row, load_results
 from analysis.report_generator import generate_report
 from analysis.spectral_analysis import (CSV_COLUMNS, analyze_spectrum, peak_repeatability,
                                         relative_response, summarize)
@@ -45,18 +45,20 @@ PLOT_DEFS = [
 
 # ---------------------------------------------------------------------- worker
 class CharacterizationWorker(QThread):
-    point_done = Signal(dict, object, object)   # result row, wavelength array, averaged spectrum
+    point_done = Signal(dict, object, object)   # result row, wavelength array (None: camera only), HDX average
     status = Signal(str)
     progress = Signal(int, int)
     failed = Signal(str)
     ask_user = Signal(str)   # GUI shows the message, then calls answer(ok)
 
-    def __init__(self, mono: MonochromatorController, hdx: OceanHDXController,
-                 params: dict, run_dir: Path, parent=None, camera_factory=ASICameraClient):
+    def __init__(self, mono: MonochromatorController, hdx: OceanHDXController | None,
+                 params: dict, run_dir: Path, parent=None, camera_factory=ASICameraClient,
+                 camera_handover=None):
         super().__init__(parent)
-        self.mono, self.hdx, self.p = mono, hdx, params
+        self.mono, self.hdx, self.p = mono, hdx, params  # hdx None: camera-only scan
         self.run_dir = run_dir
         self.camera_factory = camera_factory
+        self.camera_handover = camera_handover  # Camera tab client, lent after its preview has stopped
         self.coordinator: ScanCoordinator | None = None
         self._abort = False
         self._answer = threading.Event()
@@ -84,29 +86,46 @@ class CharacterizationWorker(QThread):
 
     def _on_point(self, point: dict, wl: np.ndarray, raw_scans: list):
         """Analysis of one completed (already saved) point; raw data is never changed here."""
-        res, avg = analyze_raw(wl, raw_scans, point["target_nm"], point["direction"],
-                               point["reported_nm"], self.hdx.dark if self.hdx.dark_active else None,
-                               self.hdx.max_intensity)
+        res, avg = {}, None
+        if wl is not None:
+            res, avg = analyze_raw(wl, raw_scans, point["target_nm"], point["direction"],
+                                   point["reported_nm"], self.hdx.dark if self.hdx.dark_active else None,
+                                   self.hdx.max_intensity)
+        else:  # camera only: no spectral metrics exist
+            res = {"set_wavelength": point["target_nm"], "direction": point["direction"],
+                   "reported_position": point["reported_nm"]}
+        if "camera" in point:
+            res.update(camera_row(self.run_dir, point))
         self.point_done.emit(res, wl, avg)
         self.progress.emit(point["index"] + 1, self._total)
 
     def run(self):
         p = self.p
         self._total = len(scan_plan(p["start"], p["stop"], p["step"], p["backward"]))
-        camera = None
-        previous_subtract = self.hdx.subtract_dark  # restored below; the manifest records what the scan applied
+        camera, own_camera = None, False
+        hdx = self.hdx
+        previous_subtract = hdx.subtract_dark if hdx is not None else None  # restored below
         try:
-            modes = {self.mono.is_simulated, self.hdx.is_simulated}
+            modes = {self.mono.is_simulated}
+            if hdx is not None:
+                modes.add(hdx.is_simulated)
             if p.get("camera"):
                 modes.add(p["camera"]["simulate"])
             if len(modes) != 1:
                 raise ValueError("Mixed real/simulated devices are not allowed; reconnect devices in one mode")
             if p.get("camera"):
-                camera = self.camera_factory(simulate=p["camera"]["simulate"], log_path=self.run_dir / "camera.log",
-                                         index=p["camera"].get("index", 0))
-            self.hdx.subtract_dark = True
-            p["dark"] = ("measured before scan" if p["measure_dark"] else
-                         "existing dark" if self.hdx.dark_valid else "none (raw counts)")
+                if self.camera_handover is not None:  # waits until the live preview exposure has ended
+                    camera = self.camera_handover.acquire(lambda: self._abort)
+                if self._abort:
+                    return
+                if camera is None:  # Camera tab not connected: this scan owns its own camera process
+                    camera = self.camera_factory(simulate=p["camera"]["simulate"], log_path=self.run_dir / "camera.log",
+                                                 index=p["camera"].get("index", 0))
+                    own_camera = True
+                elif camera.simulated != p["camera"]["simulate"]:
+                    raise ValueError("Connected camera mode does not match the scan mode")
+            if hdx is not None:
+                hdx.subtract_dark = True
             self.coordinator = ScanCoordinator(
                 self.mono, self.hdx, p, self.run_dir, camera, prompt=self._prompt,
                 on_state=lambda state, detail: self.status.emit(
@@ -118,8 +137,9 @@ class CharacterizationWorker(QThread):
         except Exception as exc:
             self.failed.emit(str(exc))
         finally:
-            self.hdx.subtract_dark = previous_subtract
-            if camera is not None:
+            if hdx is not None:
+                hdx.subtract_dark = previous_subtract
+            if camera is not None and own_camera:  # a lent camera goes back to the Camera tab
                 camera.close()
 
 
@@ -143,7 +163,7 @@ def draw_plots(plots: dict[str, pg.PlotWidget], df: pd.DataFrame, profiles: dict
             pw.addLegend(offset=(10, 10), labelTextColor=fg)
         else:
             pw.plotItem.legend.clear()
-    if df is None or df.empty:
+    if df is None or df.empty or "measured_peak" not in df:  # spectral plots need HDX data
         return
     fwd = df[df["direction"] == "forward"].sort_values("set_wavelength")
     bwd = df[df["direction"] == "backward"].sort_values("set_wavelength")
@@ -218,7 +238,8 @@ class CharacterizationPanel(QWidget):
     log_message = Signal(str)
     running_changed = Signal(bool)
 
-    TABLE_COLS = CSV_COLUMNS + ["peak_std_nm", "direction", "saturated_pixels"]
+    TABLE_COLS = CSV_COLUMNS + ["peak_std_nm", "direction", "saturated_pixels",
+                                "camera_mean_counts", "camera_saturated_pixels"]
 
     def __init__(self, mono: MonochromatorController, hdx: OceanHDXController,
                  data_dir: Path, report_dir: Path, simulation_enabled, parent=None):
@@ -233,6 +254,7 @@ class CharacterizationPanel(QWidget):
         self.last_csv: Path | None = None
         self.run_dir: Path | None = None
         self.camera_factory = ASICameraClient
+        self.camera_panel = None  # Camera tab: settings source and owner of the connected camera
         self.can_start = lambda: True
         self.recorded_devices = {}
         self._build_ui()
@@ -254,34 +276,22 @@ class CharacterizationPanel(QWidget):
         f.addRow("Start:", self.start_spin)
         f.addRow("Stop:", self.stop_spin)
         f.addRow("Step:", self.step_spin)
-        f.addRow("Averages:", self.avg_spin)
-        f.addRow("Integration:", self.int_spin)
         f.addRow("Settling time:", self.settle_spin)
         f.addRow("Entrance slit (0 = unknown):", self.entrance_slit_spin)
         f.addRow("Exit slit (0 = unknown):", self.exit_slit_spin)
         f.addRow(self.bwd_chk)
         f.addRow(self.dark_chk)
-        f.addRow("Dark averages:", self.dark_avg_spin)
-        self.dark_chk.toggled.connect(self.dark_avg_spin.setEnabled)
+        self.white_chk = QCheckBox("This scan measures a white reference")
+        f.addRow(self.white_chk)
         self.plan_lbl = QLabel()
         self.plan_lbl.setWordWrap(True)
         f.addRow(self.plan_lbl)
-        for w in (self.start_spin, self.stop_spin, self.step_spin, self.avg_spin, self.dark_avg_spin):
-            w.valueChanged.connect(self._update_plan)
-        for w in (self.bwd_chk, self.dark_chk):
-            w.toggled.connect(self._update_plan)
 
-        cam_box = QGroupBox("Camera (monochrome RAW16)")
+        # Camera: the primary channel. Its settings and connection live on the Camera tab.
+        cam_box = QGroupBox("Camera — primary (settings: Camera tab)")
         cam_box.setCheckable(True)
-        cam_box.setChecked(False)
+        cam_box.setChecked(True)
         self.cam_box = cam_box
-        self.cam_index_spin = IntSpinBox(minimum=0, maximum=63, value=0)
-        self.white_chk = QCheckBox("This scan measures a white reference")
-        self.cam_exp_spin = NumberSpinBox(decimals=3, minimum=0.001, maximum=3_600_000, value=100, suffix=" ms")
-        self.cam_gain_spin = IntSpinBox(minimum=-10000, maximum=100000, value=100)
-        self.cam_offset_spin = IntSpinBox(minimum=-32768, maximum=65535, value=50)
-        self.cam_roi = [IntSpinBox(minimum=0, maximum=100000, value=0) for _ in range(4)]
-        self.cam_bin_spin = IntSpinBox(minimum=1, maximum=16, value=1)
         cf = QFormLayout(cam_box)
         self.white_path = QLineEdit()
         self.white_path.setPlaceholderText("Optional white-reference run for ENVI export")
@@ -289,17 +299,24 @@ class CharacterizationPanel(QWidget):
         white_select.clicked.connect(self._choose_white)
         self.temp_tolerance = NumberSpinBox(minimum=0, maximum=100, value=2, decimals=1, suffix=" °C")
         cf.addRow("Reference ΔT limit:", self.temp_tolerance)
-        cf.addRow("Camera index:", self.cam_index_spin)
-        f.addRow(self.white_chk)
-        cf.addRow("Exposure:", self.cam_exp_spin)
-        cf.addRow("Gain:", self.cam_gain_spin)
-        cf.addRow("Offset:", self.cam_offset_spin)
-        cf.addRow("Binning:", self.cam_bin_spin)
-        for label, widget in zip(("ROI X:", "ROI Y:", "Width (0 = full):", "Height (0 = full):"), self.cam_roi):
-            cf.addRow(label, widget)
+
+        # HDX: optional comparison / test channel
+        hdx_box = QGroupBox("HDX spectrometer (optional)")
+        hdx_box.setCheckable(True)
+        hdx_box.setChecked(False)
+        self.hdx_box = hdx_box
+        hf = QFormLayout(hdx_box)
+        hf.addRow("Averages:", self.avg_spin)
+        hf.addRow("Integration:", self.int_spin)
+        hf.addRow("Dark averages:", self.dark_avg_spin)
+        self.dark_chk.toggled.connect(lambda on: self.dark_avg_spin.setEnabled(on))
+        for w in (self.start_spin, self.stop_spin, self.step_spin, self.avg_spin, self.dark_avg_spin):
+            w.valueChanged.connect(self._update_plan)
+        for w in (self.bwd_chk, self.dark_chk, self.cam_box, self.hdx_box):
+            w.toggled.connect(self._update_plan)
 
         run_box = QGroupBox("Run")
-        self.start_btn = QPushButton("▶  Start Characterization")
+        self.start_btn = QPushButton("▶  Start Scan")
         self.start_btn.setObjectName("primary")
         self.abort_btn = QPushButton("■  Abort")
         self.abort_btn.setObjectName("danger")
@@ -341,7 +358,7 @@ class CharacterizationPanel(QWidget):
         QVBoxLayout(summ_box).addWidget(self.summary_lbl)
 
         side = QVBoxLayout()
-        for b in (pg_box, cam_box, run_box, out_box, summ_box):
+        for b in (pg_box, cam_box, hdx_box, run_box, out_box, summ_box):
             side.addWidget(b)
         side.addStretch(1)
         inner = QWidget()
@@ -402,10 +419,11 @@ class CharacterizationPanel(QWidget):
         self._update_folder()
 
     def scan_summary(self) -> tuple[int, int, float]:
-        """Positions, HDX sample exposures and first-move target (mirrors ScanCoordinator pre-positioning)."""
+        """Positions, HDX sample exposures (0 without HDX) and first-move target (mirrors ScanCoordinator)."""
         step = self.step_spin.value()
         plan = scan_plan(self.start_spin.value(), self.stop_spin.value(), step, self.bwd_chk.isChecked())
-        return len(plan), len(plan) * self.avg_spin.value(), max(plan[0][1] - 2 * step, 200.0)
+        hdx = len(plan) * self.avg_spin.value() if self.hdx_box.isChecked() else 0
+        return len(plan), hdx, max(plan[0][1] - 2 * step, 200.0)
 
     def _update_plan(self, *_):
         try:
@@ -413,8 +431,14 @@ class CharacterizationPanel(QWidget):
         except ValueError:
             self.plan_lbl.setText("Plan: invalid range (stop must be ≥ start)")
             return
-        dark = f" + {self.dark_avg_spin.value()} dark" if self.dark_chk.isChecked() else ""
-        self.plan_lbl.setText(f"Plan: {n} position{'' if n == 1 else 's'}, {exposures} HDX exposures{dark}. "
+        parts = []
+        if self.cam_box.isChecked():
+            parts.append(f"{n} camera frame{'' if n == 1 else 's'}" + (" + 1 dark" if self.dark_chk.isChecked() else ""))
+        if self.hdx_box.isChecked():
+            parts.append(f"{exposures} HDX exposures" +
+                         (f" + {self.dark_avg_spin.value()} dark" if self.dark_chk.isChecked() else ""))
+        self.plan_lbl.setText(f"Plan: {n} position{'' if n == 1 else 's'}, "
+                              f"{', '.join(parts) or 'no channel selected'}. "
                               f"First move: GOTO {pre:g} nm (start − 2 steps, approach from below).")
 
     def _update_folder(self):
@@ -431,30 +455,43 @@ class CharacterizationPanel(QWidget):
             QMessageBox.warning(self, "Device busy", "Stop live acquisition and wait for pending device work before scanning.")
             return
         commit_spinboxes(self)  # use typed values even if Enter was not pressed
-        if not self.mono.is_connected or not self.hdx.is_connected:
-            QMessageBox.warning(self, "Not ready", "Connect both the monochromator and the spectrometer first.")
+        use_cam, use_hdx = self.cam_box.isChecked(), self.hdx_box.isChecked()
+        if not use_cam and not use_hdx:
+            QMessageBox.warning(self, "No channel", "Select the camera and/or the optional HDX spectrometer.")
+            return
+        if use_cam and self.camera_panel is None:
+            QMessageBox.warning(self, "Camera unavailable", "The Camera tab is required for camera scans.")
+            return
+        missing = [name for name, needed, dev in (("monochromator (Arduino)", True, self.mono),
+                                                  ("HDX spectrometer", use_hdx, self.hdx))
+                   if needed and not dev.is_connected]
+        if missing:
+            QMessageBox.warning(self, "Not ready", "Connect the " + " and the ".join(missing) + " first. "
+                                "A motorized scan needs the monochromator; the HDX only when it is selected.")
             return
         if self.stop_spin.value() < self.start_spin.value():
             QMessageBox.warning(self, "Invalid range", "Stop wavelength must be greater than or equal to start (equal = one wavelength).")
             return
-        if len({self.mono.is_simulated, self.hdx.is_simulated, bool(self.simulation_enabled())}) != 1:
+        camera = self.camera_panel.scan_settings() if use_cam else None
+        modes = {self.mono.is_simulated, bool(self.simulation_enabled())}
+        if use_hdx:
+            modes.add(self.hdx.is_simulated)
+        if camera is not None:
+            modes.add(camera["simulate"])
+        if len(modes) != 1:
             QMessageBox.warning(self, "Device mode mismatch", "Reconnect all devices in the selected simulation/hardware mode.")
             return
         params = dict(kind="white" if self.white_chk.isChecked() else "sample", start=self.start_spin.value(), stop=self.stop_spin.value(),
-                           step=self.step_spin.value(), averages=self.avg_spin.value(),
-                           integration_ms=self.int_spin.value(), settle_s=self.settle_spin.value(),
+                           step=self.step_spin.value(), hdx=use_hdx,
+                           averages=self.avg_spin.value() if use_hdx else None,
+                           integration_ms=self.int_spin.value() if use_hdx else None, settle_s=self.settle_spin.value(),
                            entrance_slit_um=self.entrance_slit_spin.value() or None,
                            exit_slit_um=self.exit_slit_spin.value() or None,
                            backward=self.bwd_chk.isChecked(),
                            measure_dark=self.dark_chk.isChecked(),
-                           dark_averages=self.dark_avg_spin.value(),
-                           simulation=self.mono.is_simulated or self.hdx.is_simulated,
-                           camera=dict(index=self.cam_index_spin.value(), exposure_us=round(self.cam_exp_spin.value() * 1000),
-                                       gain=self.cam_gain_spin.value(),
-                                       offset=self.cam_offset_spin.value(),
-                                       bin=self.cam_bin_spin.value(), roi=[w.value() for w in self.cam_roi],
-                                       simulate=bool(self.simulation_enabled()))
-                           if self.cam_box.isChecked() else None)
+                           dark_averages=self.dark_avg_spin.value() if use_hdx else None,
+                           simulation=self.mono.is_simulated,
+                           camera=camera)
         # Fresh operator check for every scan, before any folder, worker or motion exists.
         check = {"mode": "simulation", "confirmed": False} if params["simulation"] else self._confirm_position()
         if check is None:
@@ -462,7 +499,9 @@ class CharacterizationPanel(QWidget):
             return
         params["position_check"] = check
         self.params = params
-        self.recorded_devices = {"Monochromator": self.mono.port, "Spectrometer": self.hdx.device_info}
+        self.recorded_devices = {"Monochromator": self.mono.port}
+        if use_hdx:
+            self.recorded_devices["Spectrometer"] = self.hdx.device_info
         self.rows.clear()
         self.profiles.clear()
         self.table.setRowCount(0)
@@ -471,7 +510,9 @@ class CharacterizationPanel(QWidget):
         self.run_dir.mkdir(parents=True, exist_ok=False)
         self.progress.setValue(0)
         draw_plots(self.plots, pd.DataFrame(), {})
-        self.worker = CharacterizationWorker(self.mono, self.hdx, self.params, self.run_dir, self, camera_factory=self.camera_factory)
+        handover = self.camera_panel.begin_scan_handover() if use_cam else None  # stops live preview
+        self.worker = CharacterizationWorker(self.mono, self.hdx if use_hdx else None, self.params, self.run_dir, self,
+                                             camera_factory=self.camera_factory, camera_handover=handover)
         self.worker.point_done.connect(self._on_point)
         self.worker.status.connect(self.state_lbl.setText)
         self.worker.progress.connect(lambda i, n: (self.progress.setMaximum(n), self.progress.setValue(i)))
@@ -512,23 +553,27 @@ class CharacterizationPanel(QWidget):
         self.abort_btn.setEnabled(running)
         self.load_btn.setEnabled(not running)
         self.load_run_btn.setEnabled(not running)
+        spectral = bool(self.rows) and "measured_peak" in self.dataframe  # HDX metrics exist
         self.csv_btn.setEnabled(not running and bool(self.rows))
-        self.pdf_btn.setEnabled(not running and bool(self.rows))
+        self.pdf_btn.setEnabled(not running and spectral)
         self.envi_btn.setEnabled(not running and bool(self.params.get("camera")) and self.run_dir is not None)
-        self.white_spectra_btn.setEnabled(not running and self.run_dir is not None)
+        self.white_spectra_btn.setEnabled(not running and self.run_dir is not None and self.params.get("hdx", True))
         self.cam_box.setEnabled(not running)
+        self.hdx_box.setEnabled(not running)
         self._update_folder()
         self.running_changed.emit(running)
 
     def _on_point(self, res: dict, wl, avg):
         self.rows.append(res)
-        if res["saturated_pixels"]:
-            self.log_message.emit(f"Saturation at {res['set_wavelength']:g} nm ({res['direction']}): "
-                                  f"{res['saturated_pixels']} pixels; derived metrics may be invalid")
-        self.live_curve.setData(wl, avg)
-        self.live_set.setValue(res["set_wavelength"])
-        if res["direction"] == "forward" and abs(res["set_wavelength"] / PROFILE_EVERY_NM - round(res["set_wavelength"] / PROFILE_EVERY_NM)) < 1e-6:
-            self.profiles[res["set_wavelength"]] = (wl, avg)
+        for key, what in (("saturated_pixels", "HDX"), ("camera_saturated_pixels", "camera")):
+            if res.get(key):
+                self.log_message.emit(f"{what} saturation at {res['set_wavelength']:g} nm ({res['direction']}): "
+                                      f"{res[key]} pixels; derived values may be invalid")
+        if wl is not None:  # live spectrum and profiles only exist with the HDX
+            self.live_curve.setData(wl, avg)
+            self.live_set.setValue(res["set_wavelength"])
+            if res["direction"] == "forward" and abs(res["set_wavelength"] / PROFILE_EVERY_NM - round(res["set_wavelength"] / PROFILE_EVERY_NM)) < 1e-6:
+                self.profiles[res["set_wavelength"]] = (wl, avg)
         r = self.table.rowCount()
         self.table.insertRow(r)
         for c, key in enumerate(self.TABLE_COLS):
@@ -565,7 +610,16 @@ class CharacterizationPanel(QWidget):
                 self.log_message.emit(f"Auto-save failed: {exc}")
 
     def _show_summary(self):
-        s = summarize(self.dataframe)
+        df = self.dataframe
+        if "measured_peak" not in df:  # camera-only run: no spectral metrics
+            sat = df["camera_saturated_pixels"].fillna(0) if "camera_saturated_pixels" in df else pd.Series(dtype=float)
+            lines = [f"Points: {len(df)}", f"Camera frames: {int(df['camera_mean_counts'].notna().sum()) if 'camera_mean_counts' in df else 0}",
+                     f"Frames with saturation: {int((sat > 0).sum())}"]
+            if "camera_mean_counts" in df and df["camera_mean_counts"].notna().any():
+                lines.append(f"Mean counts: {df['camera_mean_counts'].min():.1f} – {df['camera_mean_counts'].max():.1f}")
+            self.summary_lbl.setText("\n".join(lines))
+            return
+        s = summarize(df)
         def f(k, d=3):
             v = s.get(k)
             return "n/a" if v is None or not np.isfinite(v) else f"{v:.{d}f}"
@@ -586,8 +640,9 @@ class CharacterizationPanel(QWidget):
         if path.suffix.lower() != ".csv":
             raise ValueError("CSV export requires a .csv path; raw files cannot be overwritten")
         df = self.dataframe
-        cols = CSV_COLUMNS + [c for c in ("direction", "peak_mean_nm", "peak_std_nm", "reported_position", "saturated_pixels")
-                              if c in df]
+        base = CSV_COLUMNS if "measured_peak" in df else ["set_wavelength"]
+        cols = base + [c for c in ("direction", "peak_mean_nm", "peak_std_nm", "reported_position", "saturated_pixels",
+                                   "camera_mean_counts", "camera_saturated_pixels") if c in df]
         path.parent.mkdir(parents=True, exist_ok=True)
         df[cols].to_csv(path, index=False, float_format="%.5f")
         return path
@@ -612,7 +667,7 @@ class CharacterizationPanel(QWidget):
         if not path:
             return
         try:
-            manifest, rows, profiles, problems = load_results(Path(path))
+            manifest, rows, profiles, problems = load_results(Path(path), include_camera=True)
             self.run_dir = Path(path)
             self.params = manifest["parameters"]
             self.recorded_devices = manifest["devices"]

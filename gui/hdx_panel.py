@@ -357,8 +357,8 @@ class HDXPanel(QWidget):
         try:
             manifest, _, problems = load_verified(Path(path))
             ref = manifest["references"].get("hdx_dark")
-            device = manifest["devices"]["spectrometer"]
-            if problems or not ref:
+            device = manifest["devices"].get("spectrometer")
+            if problems or not ref or device is None:
                 raise ValueError("Dark session is incomplete or failed verification")
             with self.ctrl._lock:
                 if (not self.ctrl.is_connected or device["info"] != self.ctrl.device_info or

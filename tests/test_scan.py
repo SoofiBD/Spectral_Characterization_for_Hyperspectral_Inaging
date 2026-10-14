@@ -444,6 +444,101 @@ def test_spectrometer_white_export():
     print('spectrometer white normalization OK')
 
 
+class FakeRealCamera:
+    """Hardware-mode camera stand-in (no SDK, no USB): writes RAW16 .npy like asi_camd."""
+    simulated = False
+    info = {"model": "fake", "serial": "FAKE1", "sdk": "none", "max_intensity": 65532}
+    settings = None
+
+    def configure(self, exposure_us, gain, offset, binning=1, roi=(0, 0, 0, 0)):
+        self.settings = {"exposure_us": exposure_us, "gain": gain, "offset": offset, "bin": binning,
+                         "roi": [0, 0, 16, 8], "format": "RAW16", "temperature_c": None}
+        return self.settings
+
+    def expose(self, path):
+        with open(path, "xb") as f:
+            np.save(f, np.full((8, 16), 1000, dtype="<u2"))
+        return {"width": 16, "height": 8, "exposure_us": self.settings["exposure_us"],
+                "temperature_c": None, "dropped_frames": 0}
+
+    def abort(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def camera_params(**over):
+    return params(hdx=False, averages=None, integration_ms=None, dark_averages=None, **over)
+
+
+def test_camera_only_scan_without_hdx():
+    """Primary workflow: camera + monochromator, no spectrometer object at all."""
+    for stop, backward, n, bands in ((550, False, 1, 1), (520, True, 5, 3)):
+        tmp = Path(tempfile.mkdtemp())
+        mono = MonochromatorController(SimulationState())
+        mono.connect("SIMULATED")
+        cam = ASICameraClient(simulate=True, log_path=tmp / "camera.log")
+        seen = []
+        try:
+            coord = ScanCoordinator(mono, None, camera_params(start=550 if n == 1 else 500, stop=stop, backward=backward),
+                                    tmp / "session", cam, on_point=lambda pt, wl, raw: seen.append((wl, raw)))
+            session = coord.run()
+        finally:
+            cam.close()
+        m = session.manifest
+        assert m["status"] == "complete" and m["channels"] == ["camera"], m["status"]
+        assert "spectrometer" not in m["devices"] and set(m["references"]) == {"camera_dark"}
+        assert m["parameters"]["dark"] == "camera dark measured before scan" and "dark_exposures" not in m
+        assert len(seen) == n and all(wl is None and raw == [] for wl, raw in seen)
+        for pt in m["points"]:
+            assert "hdx" not in pt and "hdx_exposures" not in pt
+            assert pt["camera"]["dtype"] == "uint16" and pt["camera"]["shape"] == [32, 64]
+        assert not list(session.root.glob("*.npz"))  # no HDX files, no invented spectra
+        _, good, problems = load_verified(session.root)
+        assert len(good) == n and not problems, problems
+        hdr = export_envi(session.root, tmp / "envi")
+        assert f"bands = {bands}" in hdr.read_text()
+    print("camera-only scans without HDX (1 point, 500-520 fwd+bwd) and ENVI OK")
+
+
+def test_camera_only_real_mode_dark_prompts():
+    """Hardware-mode flow with fakes: physical dark confirmation stays, no HDX dark is requested."""
+    class OperatorMono(MonochromatorController):
+        @property
+        def is_simulated(self): return False
+    for answers, status in (([True, True], "complete"), ([False], "aborted")):
+        tmp = Path(tempfile.mkdtemp())
+        mono = OperatorMono(SimulationState())
+        mono.connect("SIMULATED")
+        prompts, replies = [], iter(answers)
+        coord = ScanCoordinator(mono, None, camera_params(stop=510), tmp / "session", FakeRealCamera(),
+                                prompt=lambda text: (prompts.append(text), next(replies))[1])
+        session = coord.run()
+        m = session.manifest
+        assert m["status"] == status and len(prompts) == len(answers)
+        assert "block the light" in prompts[0] and not any("HDX" in t or "spectrometer" in t for t in prompts)
+        assert "hdx_dark" not in m["references"] and not (session.root / "dark.npz").exists()
+        if status == "complete":
+            assert "camera_dark" in m["references"] and len(m["points"]) == 2
+        else:
+            assert not m["points"] and not (session.root / "camera_dark.npy").exists()
+    tmp = Path(tempfile.mkdtemp())
+    mono = MonochromatorController(SimulationState())
+    mono.connect("SIMULATED")
+    try:  # simulated monochromator with a hardware camera: refused before any session exists
+        ScanCoordinator(mono, None, camera_params(stop=500), tmp / "s", FakeRealCamera()).run()
+        raise AssertionError("mixed modes accepted")
+    except ValueError as exc:
+        assert "Mixed" in str(exc) and not (tmp / "s").exists()
+    try:
+        ScanCoordinator(mono, None, camera_params(stop=500), tmp / "s2", None).run()
+        raise AssertionError("scan without channels accepted")
+    except ValueError as exc:
+        assert "channel" in str(exc)
+    print("camera-only real-mode dark prompts and channel checks OK")
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

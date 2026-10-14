@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (QDockWidget, QLabel, QMainWindow, QMessageBox, QP
 from devices.monochromator import MonochromatorController, SimulationState
 from devices.ocean_hdx import OceanHDXController
 from devices.asi_camera import ASICameraClient
+from gui.camera_panel import CameraPanel
 from gui.characterization_panel import CharacterizationPanel
 from gui.hdx_panel import HDXPanel
 from gui.monochromator_panel import MonochromatorPanel
@@ -74,23 +75,29 @@ class MainWindow(QMainWindow):
         self.sim_action.toggled.connect(self._sim_toggled)
         tb.addAction(self.sim_action)
         tb.addSeparator()
+        self.cam_ind = QLabel("● Camera")
         self.mono_ind = QLabel("● Monochromator")
-        self.hdx_ind = QLabel("● Spectrometer")
+        self.hdx_ind = QLabel("● HDX (optional)")
+        tb.addWidget(self.cam_ind)
         tb.addWidget(self.mono_ind)
         tb.addWidget(self.hdx_ind)
 
         sim = self.sim_action.isChecked
+        self.camera_panel = CameraPanel(sim, data_dir, base_dir / "logs", camera_factory)
         self.mono_panel = MonochromatorPanel(self.mono, sim)
         self.hdx_panel = HDXPanel(self.hdx, sim, data_dir)
         self.char_panel = CharacterizationPanel(self.mono, self.hdx, data_dir, report_dir, sim)
         self.char_panel.camera_factory = camera_factory
+        self.char_panel.camera_panel = self.camera_panel
+        # Live camera preview is handed over by the scan itself (it waits for the last exposure).
         self.char_panel.can_start = lambda: not (_active_tasks or self.hdx_panel._live or
                                                 self.hdx_panel._stopping or self.mono_panel._busy)
 
         self.tabs = QTabWidget()
+        self.tabs.addTab(self.camera_panel, "Camera")
         self.tabs.addTab(self.mono_panel, "Monochromator")
-        self.tabs.addTab(self.hdx_panel, "Spectrometer")
-        self.tabs.addTab(self.char_panel, "Characterization")
+        self.tabs.addTab(self.char_panel, "HSI Scan")
+        self.tabs.addTab(self.hdx_panel, "HDX (optional)")
         self.setCentralWidget(self.tabs)
 
         self.log = QPlainTextEdit(readOnly=True)
@@ -102,8 +109,9 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.BottomDockWidgetArea, dock)
         self.resizeDocks([dock], [140], Qt.Vertical)
 
-        for p in (self.mono_panel, self.hdx_panel, self.char_panel):
+        for p in (self.camera_panel, self.mono_panel, self.hdx_panel, self.char_panel):
             p.log_message.connect(self.log_event)
+        self.camera_panel.connection_changed.connect(self._update_indicators)
         self.mono_panel.connection_changed.connect(self._update_indicators)
         self.hdx_panel.connection_changed.connect(self._update_indicators)
         self.char_panel.running_changed.connect(self._on_scan_running)
@@ -116,8 +124,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(msg, 8000)
 
     def _sim_toggled(self, on: bool):
-        if self.mono.is_connected or self.hdx.is_connected:
+        if self.mono.is_connected or self.hdx.is_connected or self.camera_panel.client is not None:
             self.log_event("Simulation mode change takes effect on next connect")
+        self.camera_panel.sync_simulation(on)
         self.mono_panel.refresh_ports()
         self.log_event(f"Simulation mode {'ON' if on else 'OFF'}")
 
@@ -128,16 +137,21 @@ class MainWindow(QMainWindow):
             if dev.is_connected and dev.is_simulated:
                 color = "#d29922"
             lbl.setStyleSheet(f"color:{color}; font-weight:600; background:transparent;")
+        client = self.camera_panel.client
+        color = "#f85149" if client is None else "#d29922" if client.simulated else "#3fb950"
+        self.cam_ind.setStyleSheet(f"color:{color}; font-weight:600; background:transparent;")
 
     def _on_scan_running(self, running: bool):
         self.mono_panel.set_external_busy(running)
         self.hdx_panel.set_external_busy(running)
+        if not running:  # on start the scan has already taken the camera (begin_scan_handover)
+            self.camera_panel.set_external_busy(False)
         self.sim_action.setEnabled(not running)
         if not running:
             self.mono_panel.update_position(self.mono.position_nm)
 
     def closeEvent(self, event):
-        busy = (self.char_panel.worker is not None or _active_tasks or
+        busy = (self.char_panel.worker is not None or _active_tasks or self.camera_panel.busy or
                 self.hdx_panel._live is not None or self.hdx_panel._stopping)
         if busy:
             event.ignore()
@@ -150,9 +164,11 @@ class MainWindow(QMainWindow):
                 if self.char_panel.worker is not None:
                     self.char_panel.worker.abort()
                 self.hdx_panel.stop_live()
+                self.camera_panel.stop_live(abort=True)
                 self.setEnabled(False)
             QTimer.singleShot(100, self.close)
             return
+        self.camera_panel.shutdown()
         self.mono.disconnect()
         self.hdx.disconnect()
         event.accept()

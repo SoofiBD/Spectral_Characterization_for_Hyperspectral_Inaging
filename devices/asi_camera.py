@@ -31,7 +31,8 @@ class CameraError(Exception):
 
 
 class ASICameraClient:
-    """One camera process per scan. Methods block; call them from a worker thread."""
+    """One camera process = the only owner of that camera. Methods block; call them from a worker
+    thread. The Camera tab keeps one client for live preview and lends it to a scan."""
 
     def __init__(self, simulate: bool = False, log_path: Path | None = None, index: int = 0):
         cmd = SIM_CAMD if simulate else [str(CAMD_EXE)]
@@ -62,6 +63,11 @@ class ASICameraClient:
         except CameraError:
             self.close()
             raise
+
+    @property
+    def is_running(self) -> bool:
+        """False once the camera process has exited (QUIT, abort, crash or USB loss)."""
+        return self._proc.poll() is None
 
     def _read_stdout(self):
         try:

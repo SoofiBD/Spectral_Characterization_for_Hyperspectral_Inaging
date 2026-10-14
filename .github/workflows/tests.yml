@@ -23,6 +23,7 @@ jobs:
       - run: python tests/test_hdx_recording.py
       - run: python tests/test_simulation.py
       - run: python tests/test_gui_safety.py
+      - run: python tests/test_camera.py
       - run: python tests/test_camd.py
       - name: Check private legacy data when available
         run: python tests/test_legacy_data.py

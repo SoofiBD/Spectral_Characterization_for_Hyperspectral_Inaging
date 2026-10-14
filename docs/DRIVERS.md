@@ -55,6 +55,10 @@ must report their own encoding explicitly. Report `simulated` accurately; real/s
   C++ process to stop the exposure, then kills a stuck process after three seconds. This fallback
   bounds software waiting; it cannot prove that an unresponsive physical device has stopped.
 - `close()` releases resources. Failures use `devices.asi_camera.CameraError`.
+- `is_running` is False once the device session has ended (closed, aborted, crashed or unplugged).
+  The Camera tab uses one client for live preview (repeated `expose()` into a temporary file that is
+  deleted after loading) and lends that same client to a scan, so the factory must allow repeated
+  `configure()`/`expose()` calls on one client.
 - Optional `set_scene(wavelength_nm, dark, white)` supports coordinated simulation only.
 
 A manufacturer without gain/offset/binning controls should accept only explicit neutral values

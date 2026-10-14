@@ -10,6 +10,7 @@ class Camera(Protocol):
     simulated: bool
     info: dict
     settings: dict | None
+    is_running: bool  # False once the device session ended (closed, aborted, crashed, unplugged)
 
     def configure(self, exposure_us: int, gain: int, offset: int, binning: int,
                   roi: tuple[int, int, int, int]) -> dict: ...

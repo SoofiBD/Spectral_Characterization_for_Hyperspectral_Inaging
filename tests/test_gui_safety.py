@@ -31,6 +31,7 @@ def main():
         win=MainWindow(Path(tmp),simulate=True);win.show()
         win.mono.connect('SIMULATED');win.hdx.connect(simulate=True)
         mp,cp=win.mono_panel,win.char_panel
+        cp.cam_box.setChecked(False);cp.hdx_box.setChecked(True)  # HDX-only scans in this test
         mp._update_state();win.hdx_panel._update_state()
         callbacks={};original=mono_module.run_task
         try:

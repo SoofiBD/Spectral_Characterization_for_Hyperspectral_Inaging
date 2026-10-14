@@ -8,6 +8,7 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python tests/test_scan_preflight.py
 QT_QPA_PLATFORM=offscreen .venv/bin/python tests/test_hdx_recording.py
 QT_QPA_PLATFORM=offscreen .venv/bin/python tests/test_simulation.py
 QT_QPA_PLATFORM=offscreen .venv/bin/python tests/test_gui_safety.py
+QT_QPA_PLATFORM=offscreen .venv/bin/python tests/test_camera.py
 .venv/bin/python tests/test_camd.py
 .venv/bin/python tests/test_legacy_data.py
 ```
@@ -21,6 +22,11 @@ macOS Finder-hidden Qt plugins by copying plugin bytes to a process-local tempor
 The scan tests include actual child-process interruption, corrupt/missing references, partial
 HDX data, settle cancellation, exclusive controller access, temperature mismatch, white reference
 identity/settings/wavelength matching, and a spectrometer with a different pixel count/range.
+`test_camera.py` covers the camera-first workflow with the simulated camera process: standalone
+live view and raw-frame recording, settings changes during live view, non-blocking stop, preview/scan
+camera handover (no overlapping commands), camera + simulated Arduino scans without any HDX connection
+(one point and 500-520 nm), HDX + camera together, ENVI export and reopening, abort, simulated device
+loss and closing during a long exposure.
 These do not prove mechanical timing, USB stability or optical calibration on physical devices.
 
 ## Historical data

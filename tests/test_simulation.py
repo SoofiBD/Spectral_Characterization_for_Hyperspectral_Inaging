@@ -98,6 +98,8 @@ def test_gui():
     assert not win.hdx.dark_active and "Invalid" in hp.dark_lbl.text()
     print("dark OK:", hp.dark_lbl.text())
 
+    cp.cam_box.setChecked(False)  # HDX-only characterization (optional channel) regression
+    cp.hdx_box.setChecked(True)
     cp.int_spin.setValue(5)
     cp.avg_spin.setValue(5)
     cp.settle_spin.setValue(0)
@@ -122,10 +124,11 @@ def test_gui():
     assert manifest["status"] == "complete" and len(manifest["points"]) == 81
     assert not cp.envi_btn.isEnabled()  # no camera in this run
 
-    # Short scan with the simulated camera process, then the ENVI cube from its RAW16 frames
+    # Short HDX + camera scan (Camera tab not connected: the scan opens its own simulated camera
+    # process), then the ENVI cube from its RAW16 frames
     cp.cam_box.setChecked(True)
-    cp.cam_exp_spin.setValue(1)
-    cp.cam_bin_spin.setValue(4)
+    win.camera_panel.exp_spin.setValue(1)
+    win.camera_panel.bin_spin.setValue(4)
     cp.start_spin.setValue(500)
     cp.stop_spin.setValue(520)
     cp.bwd_chk.setChecked(False)
