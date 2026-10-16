@@ -28,3 +28,4 @@ scan sequence and manifest format.
 - Lab validation of the implemented camera dark/white reference workflow and temperature policy.
 - Absolute radiometric calibration (relative HDX white normalization and camera ENVI white correction are implemented).
 - Simultaneous HDX + camera exposure (only after timing is measured on hardware).
+- Move the monochromator wavelength scale (NM_SCALE) into the Arduino firmware (docs/FIRMWARE_CALIBRATION.md).

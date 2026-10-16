@@ -539,6 +539,22 @@ def test_camera_only_real_mode_dark_prompts():
     print("camera-only real-mode dark prompts and channel checks OK")
 
 
+def test_nm_scale_converts_commands_and_positions():
+    st = SimulationState()
+    mono = MonochromatorController(st)
+    mono.connect("SIMULATED")
+    assert mono.nm_scale == 1.0
+    mono.nm_scale = 0.9882
+    sent = []
+    mono.traffic_callback = lambda d, t: sent.append(t) if d == ">" else None
+    assert abs(mono.set_position(397.6) - 397.6) < 0.01
+    assert abs(mono.goto(800) - 800) < 0.01
+    assert abs(st.wavelength_nm - 800 / 0.9882) < 0.01  # firmware got the scaled target
+    mono.send_raw("goto:500")
+    assert abs(mono.position_nm - 500) < 0.01
+    assert sent == ["SET:402.348", "GOTO:809.553", "GOTO:505.97"], sent
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

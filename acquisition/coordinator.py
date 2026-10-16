@@ -327,7 +327,7 @@ class ScanCoordinator:
         except MonochromatorError as exc:
             mono_status = f"unavailable: {exc}"
         devices = {"monochromator": {"port": self.mono.port, "simulated": self.mono.is_simulated,
-                                     "status": mono_status}}
+                                     "nm_scale": self.mono.nm_scale, "status": mono_status}}
         if self.hdx is not None:
             devices["spectrometer"] = {"info": self.hdx.device_info, "backend": self.hdx.backend,
                                        "simulated": self.hdx.is_simulated, "max_intensity": self.hdx.max_intensity}

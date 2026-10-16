@@ -38,6 +38,12 @@ MOVE_TIMEOUT_S = 600.0   # GOTO / HOME
 RESET_TIMEOUT_S = 120.0  # RESET
 SIMULATED_PORT = "SIMULATED"
 
+# Real nm per firmware nm: the grating turns only 0.9882x the commanded distance
+# (lab fit 2026-10-16, counter vs firmware 0-800 nm, residual <0.2 nm, no measurable backlash).
+# shortcut: corrects the firmware's steps/nm in software; set to 1.0 once the firmware is fixed
+# (docs/FIRMWARE_CALIBRATION.md).
+NM_SCALE = 0.9882
+
 
 class MonochromatorError(Exception):
     """Raised for communication failures or ERROR responses from the device."""
@@ -68,7 +74,8 @@ class SimulationState:
 def list_serial_ports() -> list[str]:
     if serial is None:
         return []
-    return [p.device for p in serial.tools.list_ports.comports()]
+    # skip non-USB pseudo ports (macOS debug-console, Bluetooth) that never answer
+    return [p.device for p in serial.tools.list_ports.comports() if p.vid is not None]
 
 
 class _SimulatedSerial:
@@ -155,7 +162,8 @@ class MonochromatorController:
         self._ser = None
         self._lock = threading.RLock()
         self.port: str | None = None
-        self.position_nm: float | None = None
+        self.position_nm: float | None = None  # real nm (NM_SCALE applied)
+        self.nm_scale = NM_SCALE
         # Optional hook (direction, text) for logging raw traffic: direction is ">" or "<"
         self.traffic_callback: Callable[[str, str], None] | None = None
 
@@ -175,6 +183,7 @@ class MonochromatorController:
             if simulate or port == SIMULATED_PORT:
                 self._ser = _SimulatedSerial(self.sim_state)
                 self.port = SIMULATED_PORT
+                self.nm_scale = 1.0  # the simulator models its own grating errors
             else:
                 if serial is None:
                     raise MonochromatorError("pyserial is not installed")
@@ -186,6 +195,7 @@ class MonochromatorController:
                 except serial.SerialException as exc:
                     raise MonochromatorError(f"Cannot open {port}: {exc}") from exc
                 self.port = port
+                self.nm_scale = NM_SCALE
                 self._wake_arduino()
             self._ser.reset_input_buffer()
 
@@ -269,10 +279,14 @@ class MonochromatorController:
             raise MonochromatorError(f"Timeout waiting for response to '{cmd}' "
                                      f"(received: {lines or 'nothing'})")
 
-    @staticmethod
-    def _parse_position(line: str) -> float:
+    def _fw(self, nm: float) -> str:
+        """Real nm -> firmware nm, formatted for a command."""
+        return f"{nm / self.nm_scale:.6g}"
+
+    def _parse_position(self, line: str) -> float:
+        """Firmware position in a reply -> real nm."""
         try:
-            value = float(line.rsplit(":", 1)[1])
+            value = float(line.rsplit(":", 1)[1]) * self.nm_scale
             if not math.isfinite(value):
                 raise ValueError("non-finite position")
             return value
@@ -281,7 +295,7 @@ class MonochromatorController:
 
     # ------------------------------------------------------------------ commands
     def goto(self, wavelength_nm: float, timeout: float = MOVE_TIMEOUT_S) -> float:
-        lines = self.query(f"GOTO:{wavelength_nm:g}", ("OK:DONE",), timeout)
+        lines = self.query(f"GOTO:{self._fw(wavelength_nm)}", ("OK:DONE",), timeout)
         self.position_nm = self._parse_position(lines[-1])
         return self.position_nm
 
@@ -292,14 +306,13 @@ class MonochromatorController:
 
     def set_position(self, wavelength_nm: float) -> float:
         """SET:<nm> (firmware v2): declare the current position without moving."""
-        lines = self.query(f"SET:{wavelength_nm:g}", ("OK:SET",), 5.0)
+        lines = self.query(f"SET:{self._fw(wavelength_nm)}", ("OK:SET",), 5.0)
         self.position_nm = self._parse_position(lines[-1])
         return self.position_nm
 
     def reset(self, back_nm: float, timeout: float = RESET_TIMEOUT_S) -> float:
         """RESET:<nm>: MOVE BACK by back_nm, then the firmware calls that position 0."""
-        wavelength_nm = back_nm
-        lines = self.query(f"RESET:{wavelength_nm:g}", ("OK:RESET_DONE",), timeout)
+        lines = self.query(f"RESET:{self._fw(back_nm)}", ("OK:RESET_DONE",), timeout)
         self.position_nm = self._parse_position(lines[-1])
         return self.position_nm
 
@@ -312,9 +325,16 @@ class MonochromatorController:
         return self.query("STATUS", None, 5.0)[-1]
 
     def send_raw(self, cmd: str, timeout: float = MOVE_TIMEOUT_S) -> list[str]:
-        """Manual command: routes known commands to their proper terminator."""
+        """Manual command: routes known commands to their proper terminator.
+        GOTO/SET/RESET arguments are real nm, like the panel buttons."""
         cmd = cmd.strip()
         upper = cmd.upper()
+        name, sep, arg = cmd.partition(":")
+        if sep and name.strip().upper() in ("GOTO", "SET", "RESET"):
+            try:
+                cmd = f"{name.strip().upper()}:{self._fw(float(arg))}"
+            except ValueError:
+                pass  # let the firmware reply ERROR for a bad argument
         if upper.startswith("GOTO:") or upper == "HOME":
             lines = self.query(cmd, ("OK:DONE",), timeout)
             self.position_nm = self._parse_position(lines[-1])
