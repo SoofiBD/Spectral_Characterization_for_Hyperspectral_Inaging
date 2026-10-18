@@ -69,7 +69,7 @@ scans). Simulation uses 1.0. Each scan manifest records the value under
    ```
    and update its comment to say the firmware now carries the calibration (date + new constant).
    Leave the conversion code in place; with 1.0 it does nothing. Run the tests
-   (`.venv/bin/python tests/test_scan.py` and the others listed in `AGENTS.md`).
+   (`.venv/bin/python tests/test_scan.py` and the others listed in [VALIDATION.md](VALIDATION.md)).
 
 6. **Verify on hardware** (same test as on 2026-10-16):
    1. Connect, `GOTO` about 380, then `GOTO:400` (approach from below).

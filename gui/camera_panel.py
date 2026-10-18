@@ -16,17 +16,18 @@ from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
-                               QPushButton, QScrollArea, QVBoxLayout, QWidget)
+from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
+                               QLabel, QPushButton, QStackedWidget, QVBoxLayout, QWidget)
 
 from acquisition.camera_measurement import record_camera_frame
 from devices.asi_camera import ASICameraClient, CameraError
-from gui.widgets import IntSpinBox, NumberSpinBox, commit_spinboxes
+from gui.widgets import IntSpinBox, NumberSpinBox, commit_spinboxes, hint, set_role, set_state, side_column
 from gui.workers import run_task
 
 PREVIEW_PREFIX = "hsi_camera_preview_"  # per-connection temp folder, removed on disconnect/close
+LIVE_TEXT = {False: "▶  Start Live", True: "■  Stop Live"}
 
 
 class CameraLiveThread(QThread):
@@ -103,7 +104,7 @@ class CameraLiveThread(QThread):
 
 
 class CameraHandover:
-    """Hands the Camera tab's client to a scan worker once preview exposures have really ended."""
+    """Lend the camera client to a scan after the preview thread has stopped."""
 
     def __init__(self, threads: list[QThread], client):
         self.threads, self.client = threads, client
@@ -141,24 +142,24 @@ class CameraPanel(QWidget):
         self.sync_simulation(bool(simulation_enabled()))
         self._update_state()
 
-    # ------------------------------------------------------------------ UI
     def _build_ui(self):
         conn = QGroupBox("Camera")
         self.source_combo = QComboBox()
         self.source_combo.addItems(["Real camera (asi_camd)", "Simulated camera"])
         self.index_spin = IntSpinBox(minimum=0, maximum=63, value=0)
+        self.index_spin.setToolTip("ZWO camera index when more than one camera is attached")
         self.connect_btn = QPushButton("Connect")
-        self.connect_btn.setObjectName("primary")
+        self.connect_btn.setObjectName("accent")
         self.info_lbl = QLabel("Not connected")
         self.info_lbl.setWordWrap(True)
-        self.info_lbl.setObjectName("statusBad")
+        self.info_lbl.setObjectName("statusIdle")
         cf = QFormLayout(conn)
         cf.addRow("Source:", self.source_combo)
-        cf.addRow("Camera index:", self.index_spin)
+        cf.addRow("Index:", self.index_spin)
         cf.addRow(self.connect_btn)
         cf.addRow(self.info_lbl)
 
-        cfg = QGroupBox("Settings (RAW16)")
+        cfg = QGroupBox("Exposure (RAW16)")
         self.exp_spin = NumberSpinBox(decimals=3, minimum=0.001, maximum=3_600_000, value=100, suffix=" ms")
         # Wide input ranges: the camera SDK decides the real limits and reports the applied values.
         self.gain_spin = IntSpinBox(minimum=-10000, maximum=100000, value=100)
@@ -166,69 +167,92 @@ class CameraPanel(QWidget):
         self.bin_spin = IntSpinBox(minimum=1, maximum=16, value=1)
         self.roi_spins = [IntSpinBox(minimum=0, maximum=100000, value=0) for _ in range(4)]
         self.apply_btn = QPushButton("Apply Settings")
-        self.applied_lbl = QLabel("Applied: —")
-        self.applied_lbl.setWordWrap(True)
+        self.apply_btn.setToolTip("Send the settings to the camera now. During live view changes apply automatically.")
+        self.applied_lbl = hint("Applied: —")
         sf = QFormLayout(cfg)
         sf.addRow("Exposure:", self.exp_spin)
         sf.addRow("Gain:", self.gain_spin)
         sf.addRow("Offset:", self.offset_spin)
         sf.addRow("Binning:", self.bin_spin)
-        for label, widget in zip(("ROI X:", "ROI Y:", "Width (0 = full):", "Height (0 = full):"), self.roi_spins):
-            sf.addRow(label, widget)
+
+        rg = QGridLayout()
+        for i, (label, widget) in enumerate(zip(("X", "Y", "W", "H"), self.roi_spins)):
+            rg.addWidget(QLabel(label), i // 2, (i % 2) * 2)
+            rg.addWidget(widget, i // 2, (i % 2) * 2 + 1)
+        rg.setColumnStretch(1, 1)
+        rg.setColumnStretch(3, 1)
+        sf.addRow("ROI:", rg)
+        sf.addRow(hint("ROI width/height 0 = full sensor. During live view exposure, gain, offset and "
+                       "binning apply automatically; ROI needs Apply Settings."))
         sf.addRow(self.apply_btn)
         sf.addRow(self.applied_lbl)
 
-        live = QGroupBox("Live view")
-        self.live_btn = QPushButton("Start Live", checkable=True)
-        self.auto_chk = QCheckBox("Auto contrast (display only)", checked=True)
-        self.stats_lbl = QLabel("—")
-        self.stats_lbl.setObjectName("readout")
-        self.stats_lbl.setWordWrap(True)
-        lv = QVBoxLayout(live)
-        for w in (self.live_btn, self.auto_chk, self.stats_lbl):
-            lv.addWidget(w)
-
-        rec = QGroupBox("Record")
-        self.save_btn = QPushButton("Save Raw Frame")
-        self.save_btn.setToolTip("Records the next RAW16 frame with the applied settings into data/camera_frame_<time>/")
+        self.live_btn = QPushButton(LIVE_TEXT[False], checkable=True)
+        self.live_btn.setObjectName("accent")
+        self.live_btn.setToolTip("Start or stop the live preview (F5). Preview frames are temporary.")
+        self.save_btn = QPushButton("●  Save Raw Frame")
+        self.save_btn.setToolTip("Records the next RAW16 frame with the applied settings into "
+                                 "data/camera_frame_<time>/ (Ctrl+S)")
         self.folder_btn = QPushButton("Open Saved Folder")
-        self.saved_lbl = QLabel("Live frames are temporary; only Save Raw Frame writes data.")
-        self.saved_lbl.setWordWrap(True)
-        rv = QVBoxLayout(rec)
-        for w in (self.save_btn, self.folder_btn, self.saved_lbl):
-            rv.addWidget(w)
+        self.auto_chk = QCheckBox("Auto contrast", checked=True)
+        self.auto_chk.setToolTip("Display scaling only; the recorded RAW16 data is never changed")
+        bar = QHBoxLayout()
+        for w in (self.live_btn, self.save_btn, self.folder_btn):
+            bar.addWidget(w)
+        bar.addStretch(1)
+        bar.addWidget(self.auto_chk)
 
-        side = QVBoxLayout()
-        for b in (conn, cfg, live, rec):
-            side.addWidget(b)
-        side.addStretch(1)
-        inner = QWidget()
-        inner.setLayout(side)
-        inner.setFixedWidth(320)
-        scroll = QScrollArea()
-        scroll.setWidget(inner)
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.NoFrame)
-        scroll.setFixedWidth(320 + scroll.verticalScrollBar().sizeHint().width() + 2)
+        self.stats_lbl = QLabel("—")
+        self.stats_lbl.setObjectName("metric")
+        self.sat_lbl = QLabel("Saturated: —")
+        self.sat_lbl.setObjectName("metric")
+        self.sat_lbl.setToolTip("Pixels at the camera's maximum value; their intensities are clipped")
+        self.saved_lbl = hint("Live frames are temporary; only Save Raw Frame writes data.")
+        self.stats_lbl.hide()  # shown with the first frame
+        self.sat_lbl.hide()
+        stats = QHBoxLayout()
+        stats.addWidget(self.stats_lbl)
+        stats.addWidget(self.sat_lbl)
+        stats.addWidget(self.saved_lbl, 1)
 
-        self.view = pg.PlotWidget(title="Camera (grayscale, RAW16)")
+        self.view = pg.PlotWidget()
         self.view.setAspectLocked(True)
         self.view.invertY(True)
         self.image = pg.ImageItem(axisOrder="row-major")
         self.image.setAutoDownsample(True)
         self.view.addItem(self.image)
+        self.placeholder = QLabel()
+        self.placeholder.setObjectName("placeholder")
+        self.placeholder.setAlignment(Qt.AlignCenter)
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self.placeholder)
+        self.stack.addWidget(self.view)
 
+        right = QVBoxLayout()
+        right.addLayout(bar)
+        right.addLayout(stats)
+        right.addWidget(self.stack, 1)
         root = QHBoxLayout(self)
-        root.addWidget(scroll)
-        root.addWidget(self.view, 1)
+        root.addWidget(side_column(conn, cfg))
+        root.addLayout(right, 1)
 
         self.connect_btn.clicked.connect(self._toggle_connect)
         self.apply_btn.clicked.connect(self._apply)
         self.live_btn.toggled.connect(self._toggle_live)
         self.save_btn.clicked.connect(self.save_frame)
         self.folder_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.run_dir))))
+        # ROI is left out: its four fields are edited one at a time and an intermediate ROI could be
+        # rejected by the camera, which would end the live view. ROI changes need Apply Settings.
+        for w in (self.exp_spin, self.gain_spin, self.offset_spin, self.bin_spin):
+            w.valueChanged.connect(self._auto_apply)
+        for key, button in (("F5", self.live_btn), ("Ctrl+S", self.save_btn)):
+            QShortcut(QKeySequence(key), self, lambda b=button: b.isVisible() and b.isEnabled() and b.click())
 
-    # ------------------------------------------------------------------ state
+    def _auto_apply(self, *_):
+        """During live view a changed value is applied before the next frame (no Apply click needed)."""
+        if self._live is not None:
+            self._live.request_settings(self.settings_tuple())
+
     @property
     def busy(self) -> bool:
         """True while the camera is in use here (live, stopping or a background command)."""
@@ -261,9 +285,14 @@ class CameraPanel(QWidget):
         self.live_btn.setEnabled(c and not self._external_busy and not self._busy and not self._stopping)
         self.save_btn.setEnabled(c and not self._external_busy and not self._busy and not self._stopping)
         self.folder_btn.setEnabled(self.run_dir is not None)
-        self.info_lbl.setObjectName("statusOk" if c else "statusBad")
-        self.info_lbl.style().unpolish(self.info_lbl)
-        self.info_lbl.style().polish(self.info_lbl)
+        set_role(self.info_lbl, "statusOk" if c else "statusIdle")
+        if self.image.image is not None:
+            self.stack.setCurrentWidget(self.view)
+        else:
+            self.placeholder.setText("Press  ▶ Start Live  (F5) to see the camera image" if c else
+                                     "Connect a camera to begin\n\nChoose the source on the left, "
+                                     "then press Connect")
+            self.stack.setCurrentWidget(self.placeholder)
 
     def set_external_busy(self, busy: bool):
         """A scan owns the camera: stop the preview and lock the controls; on release re-check the client."""
@@ -282,7 +311,6 @@ class CameraPanel(QWidget):
         self.set_external_busy(True)
         return CameraHandover(list(self._stopping), self.client)
 
-    # ------------------------------------------------------------------ connection
     def _toggle_connect(self):
         if self.client is not None:
             self.disconnect()
@@ -357,7 +385,6 @@ class CameraPanel(QWidget):
             self.client.close()
         self._release_client()
 
-    # ------------------------------------------------------------------ settings
     def _apply(self):
         settings = self.settings_tuple()
         if self._live is not None:
@@ -383,7 +410,6 @@ class CameraPanel(QWidget):
         self._busy = False
         self._update_state()
 
-    # ------------------------------------------------------------------ live view
     def _toggle_live(self, on: bool):
         if on:
             if self._live is not None or self.client is None:
@@ -397,10 +423,10 @@ class CameraPanel(QWidget):
             self._shown, self._fps_clock = 0, time.monotonic()
             thread.start()
             self._timer.start()
-            self.live_btn.setText("Stop Live")
+            self.live_btn.setText(LIVE_TEXT[True])
         else:
             self.stop_live()
-            self.live_btn.setText("Start Live")
+            self.live_btn.setText(LIVE_TEXT[False])
         self._update_state()
 
     def stop_live(self, abort: bool = False):
@@ -420,7 +446,7 @@ class CameraPanel(QWidget):
         if self.live_btn.isChecked():
             self.live_btn.blockSignals(True)
             self.live_btn.setChecked(False)
-            self.live_btn.setText("Start Live")
+            self.live_btn.setText(LIVE_TEXT[False])
             self.live_btn.blockSignals(False)
 
     def _on_thread_finished(self, thread):
@@ -449,16 +475,19 @@ class CameraPanel(QWidget):
         else:
             levels = (0, maximum)
         self.image.setImage(frame, autoLevels=False, levels=levels)
+        self.stack.setCurrentWidget(self.view)
         self._shown += 1
         elapsed = time.monotonic() - self._fps_clock
         if elapsed >= 1:
             self.fps, self._shown, self._fps_clock = self._shown / elapsed, 0, time.monotonic()
         saturated = int(np.count_nonzero(frame >= maximum))
-        self.stats_lbl.setText(f"{frame.shape[1]}×{frame.shape[0]} px  {self.fps:.1f} fps\n"
-                               f"min {int(frame.min())}  max {int(frame.max())}  mean {frame.mean():.1f}\n"
-                               f"saturated {saturated} px")
+        self.stats_lbl.setText(f"{frame.shape[1]}×{frame.shape[0]} px · {self.fps:.1f} fps · "
+                               f"min {int(frame.min())}  max {int(frame.max())}  mean {frame.mean():.1f}")
+        self.sat_lbl.setText(f"Saturated: {saturated} px")
+        self.stats_lbl.show()
+        self.sat_lbl.show()
+        set_state(self.sat_lbl, "warn" if saturated else "")
 
-    # ------------------------------------------------------------------ record
     def save_frame(self):
         if self.client is None or self._external_busy:
             return
@@ -479,6 +508,7 @@ class CameraPanel(QWidget):
             self._show_applied(client.settings)
             meta = session.manifest["points"][0]["camera"]
             self.image.setImage(np.load(root / meta["file"], allow_pickle=False), autoLevels=True)
+            self.stack.setCurrentWidget(self.view)
             self._on_saved(str(root))
 
         def fail(msg):
@@ -489,7 +519,7 @@ class CameraPanel(QWidget):
 
     def _on_saved(self, root: str):
         self.run_dir = Path(root)
-        self.saved_lbl.setText("Raw frame saved. Use Open Saved Folder to view the files.")
+        self.saved_lbl.setText(f"Saved {dt.datetime.now():%H:%M:%S}: {Path(root).name}")
         self.saved_lbl.setToolTip(root)
         self.log_message.emit(f"Camera raw frame saved: {root}")
         self._update_state()

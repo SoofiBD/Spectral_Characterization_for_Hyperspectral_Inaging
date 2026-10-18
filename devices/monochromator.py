@@ -167,7 +167,6 @@ class MonochromatorController:
         # Optional hook (direction, text) for logging raw traffic: direction is ">" or "<"
         self.traffic_callback: Callable[[str, str], None] | None = None
 
-    # ------------------------------------------------------------------ connection
     @property
     def is_connected(self) -> bool:
         return self._ser is not None and self._ser.is_open
@@ -226,7 +225,6 @@ class MonochromatorController:
             self.position_nm = None  # a port reopen resets the Arduino: re-read POS before trusting it
             self.port = None
 
-    # ------------------------------------------------------------------ low level
     def _write(self, cmd: str):
         if not self.is_connected:
             raise MonochromatorError("Monochromator not connected")
@@ -293,7 +291,6 @@ class MonochromatorController:
         except (IndexError, ValueError) as exc:
             raise MonochromatorError(f"Cannot parse position from '{line}'") from exc
 
-    # ------------------------------------------------------------------ commands
     def goto(self, wavelength_nm: float, timeout: float = MOVE_TIMEOUT_S) -> float:
         lines = self.query(f"GOTO:{self._fw(wavelength_nm)}", ("OK:DONE",), timeout)
         self.position_nm = self._parse_position(lines[-1])

@@ -69,7 +69,6 @@ class HDXUSB:
         self._drain()
         self.serial_number = self._query(GET_SERIAL).split(b"\0")[0].decode("ascii", "replace")
 
-    # ------------------------------------------------------------------ discovery
     @classmethod
     def open(cls, serial_number: str | None = None) -> "HDXUSB":
         try:
@@ -110,7 +109,6 @@ class HDXUSB:
             spec.close()
         raise HDXError("; ".join(errors) or f"HDX with serial {serial_number} not found")
 
-    # ------------------------------------------------------------------ OBP transport
     def _drain(self, timeout_ms: int = 300):
         while True:
             try:
@@ -199,7 +197,6 @@ class HDXUSB:
     def _command(self, msg_type: int, payload: bytes = b""):
         self._transact(msg_type, payload, request_ack=True)
 
-    # ------------------------------------------------------------------ seabreeze-like API
     def wavelengths(self) -> np.ndarray:
         n = struct.unpack("<B", self._query(GET_WL_COEFF_COUNT)[:1])[0]
         coeffs = [struct.unpack("<f", self._query(GET_WL_COEFF, struct.pack("<B", i))[:4])[0]

@@ -1,8 +1,8 @@
 # Detailed usage guide
 
-A desktop application that drives a motorized monochromator (Arduino, serial), an Ocean Insight HDX
-spectrometer and, optionally, a ZWO ASI camera (ASI533MM Pro) for hyperspectral imaging. It runs automated wavelength-accuracy and resolution scans, analyzes the results, and
-writes CSV data and PDF reports. A built-in **simulation mode** lets you run everything without hardware.
+The application records hyperspectral scans with a ZWO ASI camera and an Arduino-controlled
+monochromator. The Ocean Insight HDX is an optional comparison channel. Use simulation mode
+to try acquisition, analysis and exports without hardware.
 
 ## Installation
 
@@ -23,7 +23,7 @@ If disk space is tight, `PySide6-Essentials` is enough to replace `PySide6`.
   not the OceanView driver.
 * **macOS:** install the libusb runtime for the native USB backend (`brew install libusb`).
 
-## Quick start (one command)
+## Launchers
 * **Windows:** double-click `run.bat`, or run `run.bat --simulate` from a terminal.
 * **macOS/Linux or Git Bash:** run `./run.sh` or `./run.sh --simulate`.
 
@@ -48,39 +48,60 @@ python main.py              # hardware mode
 python main.py --simulate   # start with simulated devices
 ```
 
-You can also switch **Simulation Mode** in the toolbar. The change takes effect on the next connect.
+You can also switch **Sim** (Simulation Mode) at the bottom of the navigation rail. The change takes
+effect on the next connect.
+
+The left navigation rail opens the Camera, Monochromator (Mono), HSI Scan (Scan) and HDX pages. The dot on
+each icon and the badge in the page header show the device state (grey: not connected, amber: simulated,
+green: real hardware); during a scan the Scan badge shows progress. **Log** shows or hides the event log
+and **Help** lists the shortcuts. Spin-box values, channel choices, window layout and the last tab are stored with
+`QSettings` and restored at the next start. The white-reference flag, SET/RESET values and
+dark subtraction must be set again for each session.
+
+| Shortcut | Action |
+| --- | --- |
+| Ctrl+1 … Ctrl+4 | Camera / Monochromator / HSI Scan / HDX page |
+| F5 | Camera: start / stop live view |
+| Ctrl+S | Camera: save the next raw frame |
+| Ctrl+Return | HSI Scan: start the scan (same checks and confirmations as the button) |
+| Ctrl+O | Open a recorded run |
+| Ctrl+L | Show / hide the event log |
+| F1 | Shortcut list |
+
+During live view, exposure, gain, offset and binning changes are applied before the next frame without clicking **Apply
+Settings**. The HSI Scan tab shows a readiness checklist, the camera settings the scan will use, the last
+recorded camera frame (decimated display copy; the raw file is only read), mean camera counts per
+wavelength (*Camera Signal* tab) and an estimated remaining time. Scan parameters are locked while a scan runs.
 In the monochromator port list, the `SIMULATED` entry always picks the fake device.
 
 ## Workflow
 The camera is the primary device and the HDX is optional. Tabs: **Camera**, **Monochromator**,
 **HSI Scan**, **HDX (optional)**.
 
-0. **Camera tab** (works alone; HDX and Arduino are not needed): choose *Real camera (asi_camd)* or
-   *Simulated camera* (follows the toolbar Simulation Mode while disconnected) and the camera index, click
+1. **Camera tab** (works alone; HDX and Arduino are not needed): choose *Real camera (asi_camd)* or
+   *Simulated camera* (follows Simulation Mode while disconnected) and the camera index, click
    **Connect** (identity: model, serial, SDK, sensor size, bit depth, pixel size). Set exposure, gain,
    offset, binning and ROI and click **Apply Settings**; the label shows the values the camera SDK
-   actually applied (the SDK decides limits and alignment). **Start Live** shows a real-time grayscale
-   view: the preview thread exposes into a temporary folder (`<system temp>/hsi_camera_preview_*`),
-   loads the frame and deletes the file at once; only the newest frame is drawn, so memory and disk use
-   do not grow. Auto contrast and levels are display only; the RAW16 data is never modified.
+   actually applied. **Start Live** shows a grayscale preview without keeping the frames.
+   Auto contrast and levels affect only the display; RAW16 data is unchanged.
    **Stop Live** returns immediately; the current exposure finishes in the background (closing the
    window aborts it). **Save Raw Frame** is the only way the tab writes data: the next RAW16 frame goes
    to `data/camera_frame_<timestamp>/` (`frame_0000.npy` + `manifest.json` with device identity,
    applied settings, UTC times, shape, dtype, size and SHA-256). Disconnect removes the preview folder.
    If the camera process ends (USB unplugged, driver crash, abort), the tab releases it and asks to reconnect.
-1. **Monochromator tab:** pick the COM port and click Connect. From here you can send GOTO, HOME,
+2. **Monochromator tab:** pick the COM port and click Connect. From here you can send GOTO, HOME,
    RESET, SET, POS and STATUS, type manual commands, and see the command history and the timestamped
    device traffic (`>>` sent, `<<` received, errors in red).
-2. **HDX (optional) tab:** click Connect and set the integration time and exposure count.
+3. **HDX (optional) tab:** click Connect and set the integration time and exposure count.
    Acquire saves every raw exposure and the aggregate automatically under `data/hdx_measurement_<timestamp>/`.
    The analysis target does not move the monochromator; it only selects the peak-search window.
    Take Dark saves every dark exposure and its mean under `data/hdx_dark_<timestamp>/`.
    Open Measurement reloads verified data; Load Saved Dark restores a verified reference only for
    the same device, simulation/hardware mode, integration time and wavelength axis.
-   Open Saved Folder opens the current recording directory. Save Spectrum exports the displayed
+   Open Folder opens the current recording directory. Save Spectrum exports the displayed
    spectrum as CSV; Start Live is a preview and does not automatically record frames.
    A live line analysis shows the peak, FWHM and SNR.
-3. **HSI Scan tab:** select the channels: **Camera — primary** (default; uses the Camera tab
+4. **HSI Scan tab:** select the channels: **Camera — primary** (default; uses the Camera tab
    settings) and/or **HDX spectrometer (optional)** (averages, integration, HDX dark averages). The
    monochromator must be connected (the scan moves it); the HDX only when its box is ticked. Set start,
    stop, step, settling time and an optional backward scan, then click Start. If the Camera tab is
@@ -94,7 +115,7 @@ The camera is the primary device and the HDX is optional. Tabs: **Camera**, **Mo
    because the firmware has no supported motor-stop command.
    Equal start and stop values acquire one wavelength using the same raw-recording workflow.
    The parameter box shows the number of positions, HDX exposures and the first move (pre-positioning
-   to start − 2 steps); the Output box shows the saved folder and has Open Saved Folder.
+   to start − 2 steps); the Results card shows the saved folder and has Open Folder.
    With real hardware every Start asks the operator to confirm that the Arduino-reported position
    matches the physical counter (unknown position: use POS first; SET defines it without motion,
    HOME and RESET move). Nothing is created or moved on No; the confirmation is stored as
@@ -108,9 +129,23 @@ The camera is the primary device and the HDX is optional. Tabs: **Camera**, **Mo
      untouched RAW16 camera frames. `manifest.json` (see below) records settings, devices,
      timestamps and the SHA-256 of every raw file. Every HDX exposure is written and recorded immediately, followed by the per-point aggregate
      and camera frame. Completed and partial points survive interruption; raw paths cannot be overwritten.
-   * **Export ENVI Cube** writes `data/run_<timestamp>_envi/cube.hdr|raw|json` (float32 BSQ,
+   * **ENVI Cube** writes `data/run_<timestamp>_envi/cube.hdr|raw|json` (float32 BSQ,
      forward points, camera dark subtracted) from the verified raw frames.
-   * **Generate PDF Report** writes `reports/spectral_report_<timestamp>.pdf`, with the plot PNGs in
+   * **Review ROI…** picks a run from a table of `data/` (status, kind, channels, range,
+     camera dark; Browse… for other folders) and opens a read-only review: all frames on one common
+     display scale, two regions A/B (in full-resolution pixels of the stored frame), their
+     dark-subtracted means ± standard error and A/B versus set wavelength for forward and backward
+     points. Saturated pixels inside a region, a denominator below 3 standard errors and an unknown
+     saturation level are flagged; forward/backward differences are matched by set wavelength.
+     If a white-reference run is selected (same rules as the ENVI export: complete `kind = white`, same
+     camera, settings and wavelengths), the same regions are divided by the white run's regions
+     ("White-corrected" mode). **Save ROI preset…** / **Load ROI…** reuse regions on runs with the same
+     frame geometry (an exported `roi.json` also works). **Export analysis…** writes
+     `data/run_<timestamp>_roi_<stamp>/` (`roi_signals.csv`, `roi_forward_backward.csv`, `roi.json`
+     with manifest/frame checksums, dark, settings and method, plus PNGs); the folder appears only
+     when complete. The standard error is pixel scatter within one frame, not repeat-measurement
+     noise.
+   * **PDF Report** writes `reports/spectral_report_<timestamp>.pdf`, with the plot PNGs in
      `reports/plots/`.
    * **Load CSV…** reloads earlier results so you can re-plot them or build a new report.
 
@@ -195,6 +230,8 @@ gui/workers.py                thread-pool / QThread helpers
 analysis/spectral_analysis.py line analysis + statistics
 analysis/report_generator.py  ReportLab PDF
 analysis/cube_export.py       ENVI cube from verified RAW16 frames
+analysis/roi_analysis.py      two-region camera analysis, presets, run list (Qt-free)
+gui/camera_review.py          run picker + read-only camera ROI review dialog
 acquisition/coordinator.py    scan state machine (single monochromator owner)
 acquisition/session.py        session folder, manifest, checksum verification
 devices/asi_camera.py         asi_camd client (process, pipe protocol, abort)
@@ -216,10 +253,12 @@ See [validation commands and limits](VALIDATION.md) for all test commands.
 QT_QPA_PLATFORM=offscreen python tests/test_simulation.py
 QT_QPA_PLATFORM=offscreen python tests/test_camera.py
 ```
-This test checks every device command and error handling, live acquisition, a full 400–800 nm
+`test_simulation.py` checks simulated device commands, error handling, live acquisition, a 400–800 nm
 forward/backward scan, the CSV export, the PDF report, and a short HDX + camera scan with ENVI export.
 `tests/test_camera.py` covers the camera-first workflow (Camera tab alone, camera + Arduino scans
 without HDX, preview/scan handover, abort, device loss and shutdown) with the simulated camera.
+`tests/test_ui_workflow.py` covers remembered settings, the readiness checklist, scan progress text and
+the camera scan views.
 `python tests/test_scan.py` covers move timeout, position mismatch, abort during an exposure,
 interrupted/corrupted session recovery, mismatched camera dark and manifest path escape.
 
@@ -232,12 +271,11 @@ The camera panel selects index, exposure/gain/offset/binning and ROI; SDK valida
 Other manufacturers can supply a local driver without changing acquisition logic. See
 [driver contracts and supported devices](DRIVERS.md). An unknown USB device still needs a driver.
 
-**Open run / recover** reloads a verified manifest and reanalyzes its complete points. Partial points,
+**Open Run…** reloads a verified manifest and reanalyzes its complete points. Partial points,
 missing references, checksum errors and unrecorded files are reported; originals are never rewritten.
 **Load CSV** uses adjacent manifest/legacy run metadata, or reports unrecorded settings as unknown.
 It does not substitute current device identities or GUI settings into historical reports.
 
 For dark/white correction, temperature limits, all test commands, and the remaining physical-device
-acceptance work, read [validation and operational limits](VALIDATION.md). The software tests cannot
-replace lab validation. The October 7 measurements are protected by a versioned review-baseline checksum
-inventory; no claim is made about an unavailable pre-review backup.
+acceptance work, read [validation and operational limits](VALIDATION.md). Historical measurement
+checksums are stored in `tests/legacy_npz_sha256.json`; the measurements themselves stay outside Git.

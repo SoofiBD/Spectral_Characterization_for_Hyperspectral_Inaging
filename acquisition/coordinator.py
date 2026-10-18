@@ -91,7 +91,6 @@ class ScanCoordinator:
         if self._abort:
             raise ScanAborted
 
-    # ------------------------------------------------------------------ run
     @property
     def channels(self) -> list[str]:
         return [name for name, dev in (("camera", self.camera), ("hdx", self.hdx)) if dev is not None]
@@ -248,7 +247,6 @@ class ScanCoordinator:
                         "n_scans": len(raw)}
         s.checkpoint()
 
-    # ------------------------------------------------------------------ references
     def _measure_dark(self):
         p = self.p
         sim = (self.hdx if self.hdx is not None else self.mono).sim_state if self._simulated else None

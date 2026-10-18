@@ -12,16 +12,15 @@ import time
 
 from PySide6.QtCore import QTimer, Signal, QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import (QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QMessageBox,
-                               QSpinBox, QComboBox, QLineEdit,
-                               QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget, QScrollArea)
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox,
+                               QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QWidget)
 
 from analysis.spectral_analysis import analyze_spectrum
 from analysis.session_analysis import load_results
 from acquisition.session import load_verified
 from acquisition.hdx_measurement import record_measurement
 from devices.ocean_hdx import OceanHDXController
-from gui.widgets import IntSpinBox, NumberSpinBox, commit_spinboxes
+from gui.widgets import IntSpinBox, NumberSpinBox, commit_spinboxes, hint, set_role, side_column
 from gui.workers import LiveAcquisitionThread, run_task
 
 
@@ -50,9 +49,10 @@ class HDXPanel(QWidget):
     def _build_ui(self):
         conn = QGroupBox("Spectrometer")
         self.connect_btn = QPushButton("Connect")
-        self.connect_btn.setObjectName("primary")
+        self.connect_btn.setObjectName("accent")
         self.info_lbl = QLabel("Not connected")
-        self.info_lbl.setObjectName("statusBad")
+        self.info_lbl.setWordWrap(True)
+        self.info_lbl.setObjectName("statusIdle")
         cf = QFormLayout(conn)
         self.backend_combo = QComboBox()
         self.backend_combo.addItems(getattr(self.ctrl, "available_backends", ["native", "pyseabreeze", "cseabreeze"]))
@@ -76,8 +76,7 @@ class HDXPanel(QWidget):
         self.save_btn = QPushButton("Save Spectrum…")
         self.open_btn = QPushButton("Open Measurement…")
         self.folder_btn = QPushButton("Open Saved Folder")
-        self.saved_lbl = QLabel("Raw exposures are saved automatically")
-        self.saved_lbl.setWordWrap(True)
+        self.saved_lbl = hint("Raw exposures are saved automatically")
         self.autoscale_chk = QCheckBox("Auto-scale Y", checked=True)
         self.autoscale_chk.toggled.connect(lambda on: setattr(self, "_y_range", None))
         ih = QHBoxLayout()
@@ -88,13 +87,20 @@ class HDXPanel(QWidget):
         af.addRow("Exposures:", self.avg_spin)
         self.target_spin.setToolTip("Peak-search wavelength only; this control does not move the monochromator")
         af.addRow("Analysis target:", self.target_spin)
-        af.addRow(self.acquire_btn)
-        af.addRow(self.live_btn)
-        af.addRow(self.save_btn)
-        af.addRow(self.open_btn)
-        af.addRow(self.folder_btn)
-        af.addRow(self.saved_lbl)
+        self.acquire_btn.setObjectName("accent")
+        self.acquire_btn.setToolTip("Record the set number of exposures (saved as raw data)")
+        acts = QHBoxLayout()
+        acts.addWidget(self.acquire_btn)
+        acts.addWidget(self.live_btn)
+        af.addRow(acts)
         af.addRow(self.autoscale_chk)
+        files = QGroupBox("Files")
+        ff = QGridLayout(files)
+        self.folder_btn.setText("Open Folder")
+        ff.addWidget(self.open_btn, 0, 0, 1, 2)
+        ff.addWidget(self.save_btn, 1, 0)
+        ff.addWidget(self.folder_btn, 1, 1)
+        ff.addWidget(self.saved_lbl, 2, 0, 1, 2)
 
         bg = QGroupBox("Background (dark)")
         self.dark_avg_spin = IntSpinBox(minimum=1, maximum=500, value=20)
@@ -127,18 +133,6 @@ class HDXPanel(QWidget):
         sf.addRow("Max counts:", self.max_lbl)
         sf.addRow("SNR:", self.snr_lbl)
 
-        side = QVBoxLayout()
-        side.addWidget(conn)
-        side.addWidget(acq)
-        side.addWidget(bg)
-        side.addWidget(stats)
-        side.addStretch(1)
-        sw = QWidget()
-        sw.setLayout(side)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(sw)
-        scroll.setFixedWidth(400)
 
         self.plot = pg.PlotWidget(title="Live Spectrum")
         # Plain labels: with units= pyqtgraph auto-scales to SI prefixes ("0.8 knm", "kcounts")
@@ -158,7 +152,7 @@ class HDXPanel(QWidget):
         self.peak_marker.hide()
 
         root = QHBoxLayout(self)
-        root.addWidget(scroll)
+        root.addWidget(side_column(conn, acq, bg, stats, files))
         root.addWidget(self.plot, 1)
 
         self.connect_btn.clicked.connect(self._toggle_connect)
@@ -173,7 +167,6 @@ class HDXPanel(QWidget):
         self.open_btn.clicked.connect(self._open_measurement)
         self.folder_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.run_dir))))
 
-    # ------------------------------------------------------------------ state
     def _update_state(self):
         c = self.ctrl.is_connected
         live = self._live is not None
@@ -196,9 +189,7 @@ class HDXPanel(QWidget):
         self.subtract_chk.setChecked(self.ctrl.subtract_dark)
         self._update_dark_label()
         self.info_lbl.setText(self.ctrl.device_info)
-        self.info_lbl.setObjectName("statusOk" if c else "statusBad")
-        self.info_lbl.style().unpolish(self.info_lbl)
-        self.info_lbl.style().polish(self.info_lbl)
+        set_role(self.info_lbl, "statusOk" if c else "statusIdle")
 
     def _update_dark_label(self):
         c = self.ctrl
@@ -234,7 +225,6 @@ class HDXPanel(QWidget):
         self._external_busy = busy
         self._update_state()
 
-    # ------------------------------------------------------------------ actions
     def _toggle_connect(self):
         if self.ctrl.is_connected:
             self.ctrl.disconnect()
@@ -453,8 +443,7 @@ class HDXPanel(QWidget):
         self.save_btn.setEnabled(True)
 
     def _smooth_autoscale(self, inten):
-        """Hysteresis autoscale: grow at once when the data leaves the range, shrink only when
-        the data uses less than half of it. Noise alone never changes the axis, so it can't jitter."""
+        """Expand to fit the data; shrink only below half the range to reduce axis jitter."""
         lo, hi = float(np.min(inten)), float(np.max(inten))
         span = max(hi - lo, 50.0)  # never zoom into pure noise
         want = (lo - 0.1 * span, hi + 0.1 * span)

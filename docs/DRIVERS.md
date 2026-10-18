@@ -1,8 +1,7 @@
 # Device support and driver contracts
 
-The acquisition coordinator is independent of the camera vendor and spectrometer pixel count.
-A driver is still required for each manufacturer's SDK/protocol. Plugging in an unknown USB device
-cannot make it supported automatically. Real device compatibility must be validated in the lab.
+The coordinator uses the interfaces in `devices/contracts.py`. Each device needs a driver
+for its SDK or protocol and lab validation before use.
 
 ## Included drivers
 
@@ -11,7 +10,7 @@ cannot make it supported automatically. Real device compatibility must be valida
   acquisition/movement, but waits for the active move to finish; there is no supported motor STOP
   command. A timeout requires checking the physical position before reconnecting/restarting.
 - **Camera:** ZWO ASI SDK cameras supporting single-exposure RAW16, on macOS/Linux. Select the
-  camera index and ROI in Characterization. Exposure, gain, offset, bin and ROI are applied through
+  camera index and ROI in the Camera tab. Exposure, gain, offset, bin and ROI are applied through
   the SDK and the applied values are recorded. Unsupported settings fail before scanning.
   The current quantitative pipeline expects monochrome 2D uint16 data; it does not demosaic Bayer
   data or treat an RGB webcam stream as a calibrated monochrome measurement.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -12,11 +13,11 @@ import pandas as pd
 import pyqtgraph as pg
 import pyqtgraph.exporters
 from PySide6.QtCore import QThread, QUrl, Signal, Qt
-from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDoubleSpinBox, QFileDialog,
-                               QFormLayout, QGroupBox, QLineEdit, QHBoxLayout, QHeaderView, QLabel,
-                               QMessageBox, QProgressBar, QPushButton, QScrollArea, QSpinBox, QSplitter,
-                               QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
+from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QFileDialog, QFormLayout,
+                               QGridLayout, QGroupBox, QLineEdit, QHBoxLayout, QHeaderView, QLabel,
+                               QMessageBox, QProgressBar, QPushButton, QSplitter, QTableWidget,
+                               QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
 from acquisition.coordinator import ScanCoordinator, State, scan_plan
 from analysis.cube_export import export_envi
@@ -28,7 +29,8 @@ from analysis.spectral_analysis import (CSV_COLUMNS, analyze_spectrum, peak_repe
 from devices.asi_camera import ASICameraClient, CameraError
 from devices.monochromator import MonochromatorController
 from devices.ocean_hdx import OceanHDXController
-from gui.widgets import IntSpinBox, NumberSpinBox, commit_spinboxes
+from gui.widgets import IntSpinBox, NumberSpinBox, commit_spinboxes, hint, side_column
+from gui.camera_review import CameraReview, RunPicker
 
 PROFILE_EVERY_NM = 50  # keep the averaged spectrum of every set wavelength that is a multiple of this
 
@@ -42,8 +44,6 @@ PLOT_DEFS = [
     ("fwd_bwd", "Forward / Backward Scan Comparison", "Set wavelength (nm)", "Measured − set (nm)"),
 ]
 
-
-# ---------------------------------------------------------------------- worker
 class CharacterizationWorker(QThread):
     point_done = Signal(dict, object, object)   # result row, wavelength array (None: camera only), HDX average
     status = Signal(str)
@@ -96,6 +96,7 @@ class CharacterizationWorker(QThread):
                    "reported_position": point["reported_nm"]}
         if "camera" in point:
             res.update(camera_row(self.run_dir, point))
+            res["camera_file"] = str(self.run_dir / point["camera"]["file"])  # preview only, popped by the GUI
         self.point_done.emit(res, wl, avg)
         self.progress.emit(point["index"] + 1, self._total)
 
@@ -142,11 +143,9 @@ class CharacterizationWorker(QThread):
             if camera is not None and own_camera:  # a lent camera goes back to the Camera tab
                 camera.close()
 
-
-# ---------------------------------------------------------------------- plotting
 def draw_plots(plots: dict[str, pg.PlotWidget], df: pd.DataFrame, profiles: dict, light=False):
     """Populate the six result plots. Used for both the GUI and the PDF export."""
-    fg = "#222222" if light else "#d0d7de"
+    fg = "#222222" if light else "#8b949e"
     c1, c2, c3 = ("#1565c0", "#c62828", "#2e7d32") if light else ("#4fc3f7", "#ff8a65", "#81c784")
     for key, title, xl, yl in PLOT_DEFS:
         pw = plots[key]
@@ -232,11 +231,10 @@ def export_plots(df: pd.DataFrame, profiles: dict, out_dir: Path, stamp: str) ->
         pw.deleteLater()
     return images
 
-
-# ---------------------------------------------------------------------- panel
 class CharacterizationPanel(QWidget):
     log_message = Signal(str)
     running_changed = Signal(bool)
+    progress_text = Signal(str)  # one-line scan progress for the status bar (empty when idle)
 
     TABLE_COLS = CSV_COLUMNS + ["peak_std_nm", "direction", "saturated_pixels",
                                 "camera_mean_counts", "camera_saturated_pixels"]
@@ -256,49 +254,85 @@ class CharacterizationPanel(QWidget):
         self.camera_factory = ASICameraClient
         self.camera_panel = None  # Camera tab: settings source and owner of the connected camera
         self.can_start = lambda: True
+        self.show_tab = lambda name: None  # set by the main window: "camera" / "mono" / "hdx"
         self.recorded_devices = {}
+        self._started = 0.0
         self._build_ui()
 
     def _build_ui(self):
-        pg_box = QGroupBox("Scan parameters")
+
+        run_box = QGroupBox("Run")
+        self.ready_lbl = QLabel()
+        self.ready_lbl.setTextFormat(Qt.RichText)
+        self.ready_lbl.setWordWrap(True)
+        self.ready_lbl.linkActivated.connect(lambda name: self.show_tab(name))
+        self.plan_lbl = hint("")
+        self.start_btn = QPushButton("▶  Start Scan")
+        self.start_btn.setObjectName("primary")
+        self.start_btn.setToolTip("Start the scan (Ctrl+Return)")
+        self.abort_btn = QPushButton("■  Abort")
+        self.abort_btn.setObjectName("danger")
+        self.abort_btn.setToolTip("Stop after the current point. Does not physically stop a motor move in progress.")
+        self.abort_btn.setEnabled(False)
+        self.progress = QProgressBar()
+        self.progress.setFormat("%v / %m")
+        self.state_lbl = QLabel("Idle")
+        self.state_lbl.setWordWrap(True)
+        buttons = QHBoxLayout()
+        buttons.addWidget(self.start_btn, 2)
+        buttons.addWidget(self.abort_btn, 1)
+        rl = QVBoxLayout(run_box)
+        rl.addWidget(self.ready_lbl)
+        rl.addWidget(self.plan_lbl)
+        rl.addLayout(buttons)
+        rl.addWidget(self.progress)
+        rl.addWidget(self.state_lbl)
+
+        pg_box = QGroupBox("Wavelength scan")
         self.start_spin = NumberSpinBox(decimals=1, minimum=200, maximum=1100, value=400, suffix=" nm")
         self.stop_spin = NumberSpinBox(decimals=1, minimum=200, maximum=1100, value=800, suffix=" nm")
         self.step_spin = NumberSpinBox(decimals=2, minimum=0.1, maximum=200, value=10, suffix=" nm")
+        self.stop_spin.setToolTip("Equal start and stop = a single wavelength")
         self.avg_spin = IntSpinBox(minimum=1, maximum=1000, value=5)
         self.int_spin = NumberSpinBox(decimals=3, minimum=OceanHDXController.MIN_INT_MS, maximum=OceanHDXController.MAX_INT_MS, value=100, suffix=" ms")
         self.settle_spin = NumberSpinBox(decimals=2, minimum=0, maximum=60, value=0.2, suffix=" s")
+        self.settle_spin.setToolTip("Wait after each move before exposing")
         self.entrance_slit_spin = NumberSpinBox(decimals=1, minimum=0, maximum=5000, value=0, suffix=" µm")
         self.exit_slit_spin = NumberSpinBox(decimals=1, minimum=0, maximum=5000, value=0, suffix=" µm")
         self.bwd_chk = QCheckBox("Include backward scan", checked=True)
+        self.bwd_chk.setToolTip("Scan back down after reaching stop (hysteresis check)")
         self.dark_chk = QCheckBox("Measure background (dark) first", checked=True)
         self.dark_avg_spin = IntSpinBox(minimum=1, maximum=500, value=20)
+        self.white_chk = QCheckBox("This scan measures a white reference")
+        self.white_chk.setToolTip("Labels the run as a white reference for later normalization")
         f = QFormLayout(pg_box)
         f.addRow("Start:", self.start_spin)
         f.addRow("Stop:", self.stop_spin)
         f.addRow("Step:", self.step_spin)
-        f.addRow("Settling time:", self.settle_spin)
-        f.addRow("Entrance slit (0 = unknown):", self.entrance_slit_spin)
-        f.addRow("Exit slit (0 = unknown):", self.exit_slit_spin)
+        f.addRow("Settling:", self.settle_spin)
         f.addRow(self.bwd_chk)
         f.addRow(self.dark_chk)
-        self.white_chk = QCheckBox("This scan measures a white reference")
         f.addRow(self.white_chk)
-        self.plan_lbl = QLabel()
-        self.plan_lbl.setWordWrap(True)
-        f.addRow(self.plan_lbl)
+
+        optics = QGroupBox("Slits (recorded only)")
+        of = QFormLayout(optics)
+        of.addRow("Entrance:", self.entrance_slit_spin)
+        of.addRow("Exit:", self.exit_slit_spin)
+        of.addRow(hint("Written to the manifest; 0 = unknown. Nothing is moved."))
 
         # Camera: the primary channel. Its settings and connection live on the Camera tab.
-        cam_box = QGroupBox("Camera — primary (settings: Camera tab)")
+        cam_box = QGroupBox("Camera channel")
         cam_box.setCheckable(True)
         cam_box.setChecked(True)
         self.cam_box = cam_box
-        cf = QFormLayout(cam_box)
-        self.white_path = QLineEdit()
-        self.white_path.setPlaceholderText("Optional white-reference run for ENVI export")
-        white_select = QPushButton("Choose white reference…")
-        white_select.clicked.connect(self._choose_white)
-        self.temp_tolerance = NumberSpinBox(minimum=0, maximum=100, value=2, decimals=1, suffix=" °C")
-        cf.addRow("Reference ΔT limit:", self.temp_tolerance)
+        self.cam_settings_lbl = QLabel()
+        self.cam_settings_lbl.setObjectName("readout")
+        self.cam_settings_lbl.setWordWrap(True)
+        cam_link = QLabel('<a href="camera" style="color:#58a6ff">Edit on the Camera tab</a>')
+        cam_link.linkActivated.connect(lambda name: self.show_tab(name))
+        cf = QVBoxLayout(cam_box)
+        cf.addWidget(self.cam_settings_lbl)
+        cf.addWidget(cam_link)
 
         # HDX: optional comparison / test channel
         hdx_box = QGroupBox("HDX spectrometer (optional)")
@@ -315,64 +349,65 @@ class CharacterizationPanel(QWidget):
         for w in (self.bwd_chk, self.dark_chk, self.cam_box, self.hdx_box):
             w.toggled.connect(self._update_plan)
 
-        run_box = QGroupBox("Run")
-        self.start_btn = QPushButton("▶  Start Scan")
-        self.start_btn.setObjectName("primary")
-        self.abort_btn = QPushButton("■  Abort")
-        self.abort_btn.setObjectName("danger")
-        self.abort_btn.setEnabled(False)
-        self.progress = QProgressBar()
-        self.state_lbl = QLabel("Idle")
-        self.state_lbl.setWordWrap(True)
-        rl = QVBoxLayout(run_box)
-        for w in (self.start_btn, self.abort_btn, self.progress, self.state_lbl):
-            rl.addWidget(w)
+        white_box = QGroupBox("White reference")
+        self.white_path = QLineEdit()
+        self.white_path.setPlaceholderText("None (optional)")
+        self.white_path.setClearButtonEnabled(True)
+        white_select = QPushButton("Choose…")
+        white_select.clicked.connect(self._choose_white)
+        self.temp_tolerance = NumberSpinBox(minimum=0, maximum=100, value=2, decimals=1, suffix=" °C")
+        self.temp_tolerance.setToolTip("Maximum sensor temperature difference between a run and its references")
+        wh = QHBoxLayout()
+        wh.addWidget(self.white_path, 1)
+        wh.addWidget(white_select)
+        wf = QFormLayout(white_box)
+        wf.addRow(wh)
+        wf.addRow("ΔT limit:", self.temp_tolerance)
+        wf.addRow(hint("Used by ENVI export, white-normalized spectra and camera review."))
 
-        out_box = QGroupBox("Output")
-        self.csv_btn = QPushButton("Export CSV…")
-        self.load_btn = QPushButton("Load CSV…")
-        self.load_run_btn = QPushButton("Open run / recover…")
-        self.pdf_btn = QPushButton("Generate PDF Report")
-        self.white_spectra_btn = QPushButton("Export white-normalized spectra")
-        self.envi_btn = QPushButton("Export ENVI Cube")
-        self.csv_btn.setEnabled(False)
-        self.pdf_btn.setEnabled(False)
-        self.white_spectra_btn.setEnabled(False)
-        self.envi_btn.setEnabled(False)
-        self.folder_lbl = QLabel()
-        self.folder_lbl.setWordWrap(True)
-        self.folder_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.folder_btn = QPushButton("Open Saved Folder")
-        ol = QVBoxLayout(out_box)
-        ol.addWidget(self.folder_lbl)
-        ol.addWidget(self.folder_btn)
-        ol.addWidget(self.white_path)
-        ol.addWidget(white_select)
-        for w in (self.csv_btn, self.load_btn, self.load_run_btn, self.pdf_btn, self.envi_btn, self.white_spectra_btn):
-            ol.addWidget(w)
-
-        summ_box = QGroupBox("Summary")
+        out_box = QGroupBox("Results")
         self.summary_lbl = QLabel("—")
         self.summary_lbl.setObjectName("summary")
         self.summary_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        QVBoxLayout(summ_box).addWidget(self.summary_lbl)
+        self.folder_lbl = hint("")
+        self.folder_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.folder_btn = QPushButton("Open Folder")
+        self.folder_btn.setToolTip("Open the current run folder (or the data folder)")
+        self.load_run_btn = QPushButton("Open Run…")
+        self.load_run_btn.setToolTip("Open a recorded run, including interrupted ones (Ctrl+O)")
+        self.load_btn = QPushButton("Load CSV…")
+        self.camera_review_btn = QPushButton("Review ROI…")
+        self.camera_review_btn.setToolTip("Read-only review of a camera run: frames and region-of-interest spectra")
+        self.csv_btn = QPushButton("CSV…")
+        self.csv_btn.setToolTip("Export the result table as CSV")
+        self.pdf_btn = QPushButton("PDF Report")
+        self.pdf_btn.setToolTip("PDF report with plots (needs HDX spectral data)")
+        self.envi_btn = QPushButton("ENVI Cube")
+        self.envi_btn.setToolTip("ENVI cube from the camera frames (forward scan); white-corrected if a reference is chosen")
+        self.white_spectra_btn = QPushButton("White Spectra")
+        self.white_spectra_btn.setToolTip("Export HDX spectra normalized by the chosen white reference")
+        for b in (self.csv_btn, self.pdf_btn, self.white_spectra_btn, self.envi_btn):
+            b.setEnabled(False)
+        grid = QGridLayout()
+        for i, b in enumerate((self.load_run_btn, self.load_btn, self.camera_review_btn, self.folder_btn)):
+            grid.addWidget(b, i // 2, i % 2)
+        grid.addWidget(hint("Export"), 2, 0, 1, 2)
+        for i, b in enumerate((self.csv_btn, self.pdf_btn, self.envi_btn, self.white_spectra_btn)):
+            grid.addWidget(b, 3 + i // 2, i % 2)
+        ol = QVBoxLayout(out_box)
+        ol.addWidget(self.summary_lbl)
+        ol.addWidget(self.folder_lbl)
+        ol.addLayout(grid)
+        self.param_boxes = (pg_box, optics, cam_box, hdx_box)
 
-        side = QVBoxLayout()
-        for b in (pg_box, cam_box, hdx_box, run_box, out_box, summ_box):
-            side.addWidget(b)
-        side.addStretch(1)
-        inner = QWidget()
-        inner.setLayout(side)
-        inner.setFixedWidth(320)
-        sw = QScrollArea()  # the parameter column no longer fits short screens
-        sw.setWidget(inner)
-        sw.setWidgetResizable(True)
-        sw.setFrameShape(QScrollArea.NoFrame)
-        sw.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        sw.setFixedWidth(320 + sw.verticalScrollBar().sizeHint().width() + 2)
-
-        # Live spectrum + result tabs
-        self.live_plot = pg.PlotWidget(title="Current Spectrum")
+        self.cam_view = pg.PlotWidget(title="Last Camera Frame")
+        self.cam_view.setAspectLocked(True)
+        self.cam_view.invertY(True)
+        self.cam_view.hideAxis("left")
+        self.cam_view.hideAxis("bottom")
+        self.cam_image = pg.ImageItem(axisOrder="row-major")
+        self.cam_view.addItem(self.cam_image)
+        self.live_plot = pg.PlotWidget(title="Current Spectrum (HDX)")
         # Plain labels: with units= pyqtgraph auto-scales to SI prefixes ("0.8 knm", "kcounts")
         self.live_plot.setLabel("bottom", "Wavelength (nm)")
         self.live_plot.setLabel("left", "Intensity (counts)")
@@ -382,8 +417,21 @@ class CharacterizationPanel(QWidget):
         self.live_curve = self.live_plot.plot(pen=pg.mkPen("#4fc3f7", width=1.5))
         self.live_set = pg.InfiniteLine(angle=90, pen=pg.mkPen("#ffb74d", style=Qt.DashLine))
         self.live_plot.addItem(self.live_set)
+        live = QSplitter(Qt.Horizontal)
+        live.addWidget(self.cam_view)
+        live.addWidget(self.live_plot)
+        live.setSizes([500, 500])
 
         self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.cam_plot = pg.PlotWidget()
+        self.cam_plot.setLabel("bottom", "Set wavelength (nm)")
+        self.cam_plot.setLabel("left", "Mean counts (raw)")
+        for ax in ("bottom", "left"):
+            self.cam_plot.getAxis(ax).enableAutoSIPrefix(False)
+        self.cam_plot.showGrid(x=True, y=True, alpha=0.25)
+        self.cam_plot.addLegend(offset=(10, 10))
+        self.tabs.addTab(self.cam_plot, "Camera Signal")
         self.plots: dict[str, pg.PlotWidget] = {}
         for key, title, *_ in PLOT_DEFS:
             pw = pg.PlotWidget()
@@ -391,18 +439,21 @@ class CharacterizationPanel(QWidget):
             self.tabs.addTab(pw, title.split(" (")[0])
         self.table = QTableWidget(0, len(self.TABLE_COLS))
         self.table.setHorizontalHeaderLabels(self.TABLE_COLS)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
         self.tabs.addTab(self.table, "Data Table")
         draw_plots(self.plots, pd.DataFrame(), {})
 
         split = QSplitter(Qt.Vertical)
-        split.addWidget(self.live_plot)
+        split.addWidget(live)
         split.addWidget(self.tabs)
-        split.setSizes([250, 550])
+        split.setSizes([300, 500])
 
         root = QHBoxLayout(self)
-        root.addWidget(sw)
+        root.addWidget(side_column(pg_box, cam_box, hdx_box, optics, white_box, out_box, header=run_box))
         root.addWidget(split, 1)
 
         self.start_btn.clicked.connect(self.start)
@@ -410,11 +461,14 @@ class CharacterizationPanel(QWidget):
         self.csv_btn.clicked.connect(self.export_csv_dialog)
         self.load_btn.clicked.connect(self.load_csv)
         self.load_run_btn.clicked.connect(self.load_run)
+        self.camera_review_btn.clicked.connect(self.review_camera)
         self.pdf_btn.clicked.connect(self.generate_pdf)
         self.envi_btn.clicked.connect(self.export_cube)
         self.white_spectra_btn.clicked.connect(self.export_white_spectra)
         self.folder_btn.clicked.connect(
             lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.run_dir or self.data_dir))))
+        QShortcut(QKeySequence("Ctrl+Return"), self,
+                  lambda: self.start_btn.isVisible() and self.start_btn.isEnabled() and self.start_btn.click())
         self._update_plan()
         self._update_folder()
 
@@ -426,6 +480,9 @@ class CharacterizationPanel(QWidget):
         return len(plan), hdx, max(plan[0][1] - 2 * step, 200.0)
 
     def _update_plan(self, *_):
+        self.cam_view.setVisible(self.cam_box.isChecked())
+        self.live_plot.setVisible(self.hdx_box.isChecked())
+        self.update_readiness()
         try:
             n, exposures, pre = self.scan_summary()
         except ValueError:
@@ -441,11 +498,49 @@ class CharacterizationPanel(QWidget):
                               f"{', '.join(parts) or 'no channel selected'}. "
                               f"First move: GOTO {pre:g} nm (start − 2 steps, approach from below).")
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.update_readiness()  # Camera tab settings may have changed meanwhile
+
+    def update_readiness(self, *_):
+        """Checklist of what the next scan needs; links jump to the tab that fixes a missing item."""
+        def line(state, text, link=None):
+            color = {"ok": "#3fb950", "sim": "#d29922", "off": "#f85149", "idle": "#8b949e"}[state]
+            mark = "●" if state in ("ok", "sim") else "○"
+            tail = f' &nbsp;<a href="{link}" style="color:#58a6ff">Connect…</a>' if link else ""
+            return f'<span style="color:{color}">{mark}</span>&nbsp; {text}{tail}'
+        def device(dev):
+            return "sim" if dev.is_simulated else "ok"
+        lines = []
+        if self.mono.is_connected:
+            pos = self.mono.position_nm
+            lines.append(line(device(self.mono), "Monochromator" + (f" at {pos:g} nm" if pos is not None else
+                                                                    " (position unknown)")))
+        else:
+            lines.append(line("off", "Monochromator — required", "mono"))
+        cam_settings = "—"
+        if self.cam_box.isChecked() and self.camera_panel is not None:
+            client = self.camera_panel.client
+            if client is not None:
+                lines.append(line("sim" if client.simulated else "ok", "Camera connected"))
+            else:
+                lines.append(line("idle", "Camera — the scan opens it itself", "camera"))
+            c = self.camera_panel  # displayed values only; scan_settings() commits typed text at start
+            w, h = c.roi_spins[2].value(), c.roi_spins[3].value()
+            cam_settings = (f"{c.exp_spin.value():g} ms · gain {c.gain_spin.value()} · offset {c.offset_spin.value()}\n"
+                            f"bin {c.bin_spin.value()} · ROI " + (f"{w}×{h}" if w and h else "full sensor"))
+        self.cam_settings_lbl.setText(cam_settings)
+        if self.hdx_box.isChecked():
+            lines.append(line(device(self.hdx), "HDX connected") if self.hdx.is_connected else
+                         line("off", "HDX — required when selected", "hdx"))
+        if not self.cam_box.isChecked() and not self.hdx_box.isChecked():
+            lines.append(line("off", "Select the camera and/or the HDX channel"))
+        self.ready_lbl.setText("<br>".join(lines))
+
     def _update_folder(self):
         self.folder_lbl.setText(f"Saved folder: {self.run_dir}" if self.run_dir else
                                 f"New scans are saved under: {self.data_dir}")
 
-    # ------------------------------------------------------------------ run control
     @property
     def dataframe(self) -> pd.DataFrame:
         return pd.DataFrame(self.rows)
@@ -509,13 +604,18 @@ class CharacterizationPanel(QWidget):
         self.run_dir = self.data_dir / f"run_{dt.datetime.now():%Y%m%d_%H%M%S_%f}"
         self.run_dir.mkdir(parents=True, exist_ok=False)
         self.progress.setValue(0)
+        self._started = time.monotonic()
         draw_plots(self.plots, pd.DataFrame(), {})
+        self._draw_camera_signal()
+        self.cam_image.clear()
+        self.live_curve.setData([], [])
+        self.tabs.setCurrentWidget(self.plots["accuracy"] if use_hdx else self.cam_plot)
         handover = self.camera_panel.begin_scan_handover() if use_cam else None  # stops live preview
         self.worker = CharacterizationWorker(self.mono, self.hdx if use_hdx else None, self.params, self.run_dir, self,
                                              camera_factory=self.camera_factory, camera_handover=handover)
         self.worker.point_done.connect(self._on_point)
         self.worker.status.connect(self.state_lbl.setText)
-        self.worker.progress.connect(lambda i, n: (self.progress.setMaximum(n), self.progress.setValue(i)))
+        self.worker.progress.connect(self._on_progress)
         self.worker.failed.connect(self._on_failed)
         self.worker.ask_user.connect(self._on_ask_user)
         self.worker.finished.connect(self._on_finished)
@@ -543,6 +643,14 @@ class CharacterizationPanel(QWidget):
         return {"mode": "hardware", "confirmed": True, "reported_nm": reported,
                 "confirmed_at": dt.datetime.now().astimezone().isoformat(timespec="seconds")}
 
+    def _on_progress(self, i: int, n: int):
+        self.progress.setMaximum(n)
+        self.progress.setValue(i)
+        left = (time.monotonic() - self._started) / i * (n - i) if i else 0
+        eta = f"~{left / 60:.0f} min left" if left >= 90 else f"~{left:.0f} s left"
+        self.progress.setFormat(f"%v / %m · {eta}" if i < n else "%v / %m")
+        self.progress_text.emit(f"Scan {i}/{n} · {eta}" if i < n else f"Scan {i}/{n}")
+
     def abort(self):
         if self.worker:
             self.worker.abort()
@@ -553,18 +661,27 @@ class CharacterizationPanel(QWidget):
         self.abort_btn.setEnabled(running)
         self.load_btn.setEnabled(not running)
         self.load_run_btn.setEnabled(not running)
+        self.camera_review_btn.setEnabled(not running)  # opens the run picker (current run preselected)
         spectral = bool(self.rows) and "measured_peak" in self.dataframe  # HDX metrics exist
         self.csv_btn.setEnabled(not running and bool(self.rows))
         self.pdf_btn.setEnabled(not running and spectral)
         self.envi_btn.setEnabled(not running and bool(self.params.get("camera")) and self.run_dir is not None)
         self.white_spectra_btn.setEnabled(not running and self.run_dir is not None and self.params.get("hdx", True))
-        self.cam_box.setEnabled(not running)
-        self.hdx_box.setEnabled(not running)
+        for box in self.param_boxes:  # the running scan has its parameters; editing would only mislead
+            box.setEnabled(not running)
+        if running:
+            self.progress.setFormat("%v / %m")
+        else:
+            self.progress_text.emit("")
         self._update_folder()
         self.running_changed.emit(running)
 
     def _on_point(self, res: dict, wl, avg):
+        frame_path = res.pop("camera_file", None)
         self.rows.append(res)
+        if frame_path is not None:
+            self._show_camera_frame(Path(frame_path))
+            self._draw_camera_signal()
         for key, what in (("saturated_pixels", "HDX"), ("camera_saturated_pixels", "camera")):
             if res.get(key):
                 self.log_message.emit(f"{what} saturation at {res['set_wavelength']:g} nm ({res['direction']}): "
@@ -583,6 +700,33 @@ class CharacterizationPanel(QWidget):
         self.table.scrollToBottom()
         draw_plots(self.plots, self.dataframe, self.profiles)
 
+    def _show_camera_frame(self, path: Path):
+        """Display a decimated copy of a recorded frame (the raw file is only read)."""
+        try:
+            frame = np.load(path, mmap_mode="r", allow_pickle=False)
+            step = max(1, int(np.ceil(max(frame.shape) / 1000)))
+            view = np.asarray(frame[::step, ::step], dtype=np.float32)
+        except (OSError, ValueError) as exc:
+            self.log_message.emit(f"Camera preview unavailable: {exc}")
+            return
+        lo, hi = np.percentile(view, (0.5, 99.5))
+        self.cam_image.setImage(view, autoLevels=False, levels=(float(lo), float(hi) if hi > lo else float(lo) + 1))
+
+    def _draw_camera_signal(self):
+        """Mean raw counts per set wavelength (camera channel), forward and backward separately."""
+        pw = self.cam_plot
+        pw.clear()
+        pw.plotItem.legend.clear()
+        df = self.dataframe
+        if df.empty or "camera_mean_counts" not in df:
+            return
+        for direction, color, symbol in (("forward", "#4fc3f7", "o"), ("backward", "#ff8a65", "t")):
+            part = df[(df["direction"] == direction) & df["camera_mean_counts"].notna()].sort_values("set_wavelength")
+            if len(part):
+                pw.plot(part["set_wavelength"].to_numpy(), part["camera_mean_counts"].to_numpy(),
+                        pen=pg.mkPen(color, width=2), symbol=symbol, symbolSize=6, symbolBrush=color,
+                        name=direction.capitalize())
+
     def _on_ask_user(self, text: str):
         ok = QMessageBox.question(self, "Operator action", text,
                                   QMessageBox.Ok | QMessageBox.Cancel) == QMessageBox.Ok
@@ -595,11 +739,14 @@ class CharacterizationPanel(QWidget):
         QMessageBox.critical(self, "Characterization failed", msg)
 
     def _on_finished(self):
+        self.worker = None  # first: an unreadable manifest must not leave the controls locked
         if self.run_dir and (self.run_dir / "manifest.json").exists():
-            info = json.loads((self.run_dir / "manifest.json").read_text())
-            self.params = info["parameters"]
-            self.recorded_devices = info["devices"]
-        self.worker = None
+            try:
+                info = json.loads((self.run_dir / "manifest.json").read_text())
+                self.params = info["parameters"]
+                self.recorded_devices = info["devices"]
+            except (OSError, ValueError, KeyError) as exc:
+                self.log_message.emit(f"Run manifest could not be read: {exc}")
         self._set_running(False)
         if self.rows:
             self._show_summary()
@@ -635,7 +782,6 @@ class CharacterizationPanel(QWidget):
             lines.append(f"Fwd−Bwd: {f('hysteresis_mean_nm')} nm")
         self.summary_lbl.setText("\n".join(lines))
 
-    # ------------------------------------------------------------------ I/O
     def save_csv(self, path: Path) -> Path:
         if path.suffix.lower() != ".csv":
             raise ValueError("CSV export requires a .csv path; raw files cannot be overwritten")
@@ -658,9 +804,21 @@ class CharacterizationPanel(QWidget):
                 QMessageBox.critical(self, "Export failed", str(exc))
 
     def _choose_white(self):
-        path = QFileDialog.getExistingDirectory(self, "White-reference run", str(self.data_dir))
+        path = RunPicker.choose(self.data_dir, self, kind="white", title="Choose white-reference run", camera_only=False,
+                                current=Path(self.white_path.text()) if self.white_path.text().strip() else None)
         if path:
-            self.white_path.setText(path)
+            self.white_path.setText(str(path))
+
+    def review_camera(self):
+        """Pick a verified camera run (current one preselected) and open the read-only ROI review."""
+        path = RunPicker.choose(self.data_dir, self, current=self.run_dir, title="Review camera run")
+        if path is None:
+            return
+        white = self.white_path.text().strip()
+        try:
+            CameraReview(path, self, self.temp_tolerance.value(), Path(white) if white else None).exec()
+        except Exception as exc:
+            QMessageBox.critical(self, "Cannot review camera scan", str(exc))
 
     def load_run(self):
         path = QFileDialog.getExistingDirectory(self, "Open verified run", str(self.data_dir))
@@ -684,6 +842,9 @@ class CharacterizationPanel(QWidget):
             self.profiles.update(profiles)
             self.last_csv = None
             draw_plots(self.plots, self.dataframe, self.profiles)
+            self._draw_camera_signal()
+            if "measured_peak" not in self.dataframe:
+                self.tabs.setCurrentWidget(self.cam_plot)
             if rows:
                 self._show_summary()
             self._set_running(False)
@@ -728,6 +889,7 @@ class CharacterizationPanel(QWidget):
                     v = res.get(key)
                     self.table.setItem(r, c, QTableWidgetItem(f"{v:.4f}" if isinstance(v, float) else str(v)))
             draw_plots(self.plots, df, self.profiles)
+            self._draw_camera_signal()
             self._show_summary()
             self._set_running(False)
             self.log_message.emit(f"Loaded {len(df)} rows from {path}")

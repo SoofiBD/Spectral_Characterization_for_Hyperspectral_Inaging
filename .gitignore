@@ -21,7 +21,6 @@ hsi/lamda_hsi/ASI_linux_mac_SDK_V1.41/lib/
 
 # Editors / OS
 .cache/
-.claude/
 .vscode/
 .idea/
 .DS_Store
@@ -36,3 +35,22 @@ hsi/lamda_hsi/ASI_linux_mac_SDK_V1.41/lib/
 *.tmp
 *.bak
 *~
+
+# Local assistant instructions and session files
+AGENTS.md
+AGENTS.override.md
+CLAUDE.md
+GEMINI.md
+.codex/
+.agents/
+.claude/
+.cursor/
+.cursorrules
+.aider*
+.github/copilot-instructions.md
+
+# Local publishing notes
+/.github/REPOSITORY_SETTINGS.md
+
+# Compiled SDK examples
+/hsi/lamda_hsi/ASI_linux_mac_SDK_V1.41/demo/bin/

@@ -30,7 +30,7 @@ def utc_now() -> str:
 
 
 def save_spectra(path: Path, **arrays):
-    """Write an .npz atomically (temp file, fsync, exclusive hard link) so a crash never leaves half a file."""
+    """Publish a flushed .npz through an exclusive hard link, without overwriting raw data."""
     temporary = path.with_suffix(".tmp")
     if path.exists():
         raise FileExistsError(f"Raw file already exists: {path}")

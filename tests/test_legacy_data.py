@@ -1,4 +1,4 @@
-"""Read-only check against the October 12 audit baseline, not a historical authenticity claim."""
+"""Check private measurement files against the recorded SHA-256 hashes."""
 import hashlib
 import json
 from pathlib import Path

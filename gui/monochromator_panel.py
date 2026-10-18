@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import datetime as dt
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFormLayout, QGridLayout, QGroupBox,
                                QHBoxLayout, QLabel, QLineEdit, QListWidget, QPlainTextEdit,
                                QPushButton, QVBoxLayout, QWidget)
 
 from devices.monochromator import (BAUDRATE, BAUDRATES, MonochromatorController, SIMULATED_PORT,
                                    list_serial_ports)
-from gui.widgets import NumberSpinBox, committed
+from gui.widgets import NumberSpinBox, committed, hint, set_role
 from gui.workers import run_task
 
 
@@ -32,7 +32,6 @@ class MonochromatorPanel(QWidget):
         self.refresh_ports()
         self._update_state()
 
-    # ------------------------------------------------------------------ UI
     def _build_ui(self):
         conn = QGroupBox("Connection")
         self.port_combo = QComboBox()
@@ -40,11 +39,12 @@ class MonochromatorPanel(QWidget):
         self.baud_combo = QComboBox()
         self.baud_combo.addItems([str(b) for b in BAUDRATES])
         self.baud_combo.setCurrentText(str(BAUDRATE))
-        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn = QPushButton("↻")
+        self.refresh_btn.setToolTip("Rescan serial ports")
         self.connect_btn = QPushButton("Connect")
-        self.connect_btn.setObjectName("primary")
+        self.connect_btn.setObjectName("accent")
         self.status_lbl = QLabel("DISCONNECTED")
-        self.status_lbl.setObjectName("statusBad")
+        self.status_lbl.setObjectName("statusIdle")
         self.pos_lbl = QLabel("— nm")
         self.pos_lbl.setObjectName("bigReadout")
         h = QHBoxLayout()
@@ -61,10 +61,13 @@ class MonochromatorPanel(QWidget):
         f.addRow("Position:", self.pos_lbl)
         cl.addLayout(f)
 
-        motion = QGroupBox("Motion")
+        # Commands that move the grating are separated from those that only talk to the controller.
+        motion = QGroupBox("Motion — moves the grating")
         self.goto_spin = NumberSpinBox(decimals=2, minimum=0, maximum=2000, value=550, suffix=" nm")
         self.goto_btn = QPushButton("GOTO")
+        self.goto_btn.setToolTip("Move the grating to this wavelength")
         self.home_btn = QPushButton("HOME")
+        self.home_btn.setToolTip("Move the grating to its home position")
         self.set_spin = NumberSpinBox(decimals=2, minimum=0, maximum=2000, value=550, suffix=" nm")
         self.set_btn = QPushButton("SET")
         self.set_btn.setToolTip("Firmware v2: declare the current position without moving")
@@ -72,21 +75,31 @@ class MonochromatorPanel(QWidget):
         self.reset_btn = QPushButton("RESET")
         self.reset_btn.setToolTip("Moves the grating BACK by this amount, then calls that position 0")
         self.pos_btn = QPushButton("POS")
+        self.pos_btn.setToolTip("Read the position reported by the controller")
         self.status_btn = QPushButton("STATUS")
+        self.status_btn.setToolTip("Read the controller status")
+        for b in (self.goto_btn, self.home_btn, self.reset_btn):
+            b.setObjectName("motion")
         g = QGridLayout(motion)
         g.addWidget(QLabel("Go to:"), 0, 0)
         g.addWidget(self.goto_spin, 0, 1)
         g.addWidget(self.goto_btn, 0, 2)
-        g.addWidget(QLabel("Current position is:"), 1, 0)
-        g.addWidget(self.set_spin, 1, 1)
-        g.addWidget(self.set_btn, 1, 2)
-        g.addWidget(QLabel("Move back && zero:"), 2, 0)
-        g.addWidget(self.reset_spin, 2, 1)
-        g.addWidget(self.reset_btn, 2, 2)
+        g.addWidget(QLabel("Move back & zero:"), 1, 0)
+        g.addWidget(self.reset_spin, 1, 1)
+        g.addWidget(self.reset_btn, 1, 2)
+        g.addWidget(self.home_btn, 2, 2)
+
+        calib = QGroupBox("Position — no motion")
+        cg = QGridLayout(calib)
+        cg.addWidget(QLabel("Current position is:"), 0, 0)
+        cg.addWidget(self.set_spin, 0, 1)
+        cg.addWidget(self.set_btn, 0, 2)
         row = QHBoxLayout()
-        for b in (self.home_btn, self.pos_btn, self.status_btn):
+        for b in (self.pos_btn, self.status_btn):
             row.addWidget(b)
-        g.addLayout(row, 3, 0, 1, 3)
+        cg.addLayout(row, 1, 0, 1, 3)
+        cg.addWidget(hint("Compare the reported position with the physical counter; fix a mismatch with SET."),
+                     2, 0, 1, 3)
 
         manual = QGroupBox("Manual command")
         self.cmd_edit = QLineEdit(placeholderText="e.g. GOTO:550, SET:550, HOME, POS, STATUS")
@@ -107,16 +120,18 @@ class MonochromatorPanel(QWidget):
         clear.clicked.connect(self.console.clear)
         rl = QVBoxLayout(resp)
         rl.addWidget(self.console)
-        rl.addWidget(clear)
+        rl.addWidget(clear, 0, Qt.AlignRight)
+        self.history.setToolTip("Double-click a command to copy it into the manual command field")
 
         left = QVBoxLayout()
         left.addWidget(conn)
         left.addWidget(motion)
+        left.addWidget(calib)
         left.addWidget(manual)
         left.addWidget(hist, 1)
         root = QHBoxLayout(self)
-        root.addLayout(left, 2)
-        root.addWidget(resp, 3)
+        root.addLayout(left, 1)
+        root.addWidget(resp, 1)
 
         self.refresh_btn.clicked.connect(self.refresh_ports)
         self.connect_btn.clicked.connect(self._toggle_connect)
@@ -130,7 +145,6 @@ class MonochromatorPanel(QWidget):
         self.cmd_edit.returnPressed.connect(self._send_manual)
         self.history.itemDoubleClicked.connect(lambda it: self.cmd_edit.setText(it.text().split("  ", 1)[-1]))
 
-    # ------------------------------------------------------------------ helpers
     def refresh_ports(self):
         current = self.port_combo.currentText()
         self.port_combo.clear()
@@ -169,9 +183,8 @@ class MonochromatorPanel(QWidget):
 
     def _set_status(self, text: str, bad=False, busy=False):
         self.status_lbl.setText(text)
-        self.status_lbl.setObjectName("statusBad" if bad else "statusBusy" if busy else "statusOk")
-        self.status_lbl.style().unpolish(self.status_lbl)
-        self.status_lbl.style().polish(self.status_lbl)
+        set_role(self.status_lbl, "statusIdle" if text == "DISCONNECTED" else
+                 "statusBad" if bad else "statusBusy" if busy else "statusOk")
 
     def set_external_busy(self, busy: bool):
         """Lock manual controls while an automated scan owns the device."""
@@ -182,7 +195,6 @@ class MonochromatorPanel(QWidget):
         if nm is not None:
             self.pos_lbl.setText(f"{nm:.2f} nm")
 
-    # ------------------------------------------------------------------ actions
     def _toggle_connect(self):
         if self.ctrl.is_connected:
             self.ctrl.disconnect()

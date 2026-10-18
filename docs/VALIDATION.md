@@ -9,6 +9,8 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python tests/test_hdx_recording.py
 QT_QPA_PLATFORM=offscreen .venv/bin/python tests/test_simulation.py
 QT_QPA_PLATFORM=offscreen .venv/bin/python tests/test_gui_safety.py
 QT_QPA_PLATFORM=offscreen .venv/bin/python tests/test_camera.py
+QT_QPA_PLATFORM=offscreen .venv/bin/python tests/test_camera_review.py
+QT_QPA_PLATFORM=offscreen .venv/bin/python tests/test_ui_workflow.py
 .venv/bin/python tests/test_camd.py
 .venv/bin/python tests/test_legacy_data.py
 ```
@@ -32,8 +34,7 @@ These do not prove mechanical timing, USB stability or optical calibration on ph
 ## Historical data
 
 `tests/legacy_npz_sha256.json` records the 91 existing NPZ files at the October 12 review baseline.
-Their aggregate and individual hashes were unchanged during this implementation. This is a
-baseline for future integrity checks, **not proof of identity with an unavailable October 7 backup**.
+This baseline detects changes to those files; it does not verify earlier backups.
 The files remain private and outside Git. The integrity test skips when the private runs are absent.
 Do not regenerate the baseline to make a failed integrity test pass.
 
@@ -42,7 +43,7 @@ Do not regenerate the baseline to make a failed integrity test pass.
 Use a local filesystem supporting atomic rename and hard links (APFS, ext4, NTFS). Network mounts,
 FAT/exFAT and sudden power loss have not been validated. Raw publication fails rather than replacing
 an existing file. Version 3 manifests retain per-exposure records and partial points; version 2
-manifests remain readable. After a crash, open the run using **Open run / recover**. Complete verified
+manifests remain readable. After a crash, open the run using **Open Run…**. Complete verified
 points are reanalyzed; partial points and unrecorded files are listed separately and retained.
 No motor movement, automatic resume, raw rewrite or automatic trust of orphan files occurs.
 CSV/PDF/ENVI exports are derived artifacts. Keep them outside the source run when recovering data.
@@ -62,7 +63,7 @@ Select that run for the sample's ENVI export. Both runs must have matching camer
 direction and wavelength coverage. The output is `(sample - sample_dark)/(white - white_dark)`.
 Non-positive white denominators become NaN and are counted; saturated white frames are rejected.
 This is relative reflectance assuming a unit white standard, not absolute radiometric calibration.
-HDX raw spectra remain in original counts. **Export white-normalized spectra** separately writes
+HDX raw spectra remain in original counts. **White Spectra** separately writes
 `relative_signal` NPZ arrays using the same dark/white ratio. Spectrometer identity, wavelength axis,
 integration time, scan direction, reference coverage and saturation are checked. Non-positive white
 denominators become NaN; off-line pixels can therefore be undefined. These ratios are not absolute

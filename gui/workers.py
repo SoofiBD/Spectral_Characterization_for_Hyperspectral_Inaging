@@ -55,9 +55,8 @@ def run_task(fn, *args, on_result=None, on_error=None, on_finished=None, **kwarg
 class LiveAcquisitionThread(QThread):
     """Continuous spectrum acquisition loop.
 
-    The thread never pushes frames to the GUI. It only keeps the newest spectrum; the GUI pulls
-    it with a timer at whatever rate it can draw. Acquisition speed therefore can never fill the
-    GUI event queue, and clicks (Stop Live) are handled immediately.
+    Keep only the latest spectrum. The GUI reads it on a timer so acquisition
+    cannot flood the event queue with pending frames.
     """
 
     error = Signal(str)
