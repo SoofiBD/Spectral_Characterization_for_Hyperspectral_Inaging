@@ -15,7 +15,7 @@ source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-If disk space is tight, `PySide6-Essentials` is enough to replace `PySide6`.
+`requirements.txt` installs `PySide6-Essentials` only (QtCore, QtGui, QtWidgets, QtSvg); the full `PySide6` (~1 GB more) is not needed.
 
 ### Spectrometer drivers
 * **Linux:** run `seabreeze_os_setup` once to install the udev rules.
