@@ -228,11 +228,16 @@ def main():
         cam.connect_btn.click()
         wait(app, lambda: cam.client is not None and cam.live_btn.isEnabled(), what="reconnect")
         lost_preview = cam.preview_dir
+        lost_log = cam.client.log_path
         cam.live_btn.setChecked(True)
         wait(app, lambda: cam._live is not None and cam._live.frames >= 1, what="live before loss")
         cam.client._proc.kill()  # stands in for a USB disconnect / driver crash
         wait(app, lambda: cam.client is None and not cam.busy, what="lost camera released")
         assert not lost_preview.exists() and not cam.live_btn.isChecked()
+        stopped, released = logs[-2:]  # one reason line and one release line, both naming the log
+        assert stopped.startswith("Camera live view stopped:") and released.startswith("Camera process ended"), logs
+        log_hint = f"(camera log: {lost_log})"
+        assert stopped.endswith(log_hint) and released.endswith(log_hint), logs
         print("camera loss during live view handled OK")
 
         # 7) Close while live: exposure aborted, preview folder removed, process ended.

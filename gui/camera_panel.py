@@ -369,8 +369,12 @@ class CameraPanel(QWidget):
         self.connection_changed.emit(False)
         self._update_state()
 
+    def _log_hint(self) -> str:
+        path = getattr(self.client, "log_path", None)
+        return f" (camera log: {path})" if path else ""
+
     def _client_lost(self, message: str):
-        self.log_message.emit(message)
+        self.log_message.emit(message + self._log_hint())
         client = self.client
         if client is not None:
             client.close()  # process already ended: no QUIT wait; closes pipes and the log
@@ -456,7 +460,7 @@ class CameraPanel(QWidget):
         self._update_state()
 
     def _on_live_error(self, thread, msg: str):
-        self.log_message.emit(f"Camera live view stopped: {msg}")
+        self.log_message.emit(f"Camera live view stopped: {msg}{self._log_hint()}")
         if thread is self._live:
             self.live_btn.setChecked(False)
 

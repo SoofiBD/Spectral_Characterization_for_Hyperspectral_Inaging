@@ -6,7 +6,9 @@
 //                                             -> OK {json applied settings}   (w/h = 0: full frame)
 //   EXPOSE <path>                             -> OK {json frame info}         (RAW16 written as .npy)
 //   QUIT                                      -> exits
-// Any failure replies "ERROR <msg>". SIGTERM/SIGINT aborts a running exposure, replies
+// Any failure replies "ERROR <msg>"; a failed CONFIG/EXPOSE after which the SDK enumerates no
+// camera adds "USB device disappeared" and the process exits (code 2); one after which the SDK
+// reports the camera handle closed/removed adds "camera handle lost" and exits (code 3). SIGTERM/SIGINT aborts a running exposure, replies
 // "ERROR aborted" and exits. This process never touches the monochromator serial port.
 
 #include "camera.h"
@@ -110,9 +112,17 @@ std::string configure(mc::Camera& cam, std::istringstream& args) {
   if (h == 0) h = (static_cast<int>(info.MaxHeight) / bin) & ~1;  // ASI: height % 2 == 0
   cam.setRoi({w, h, bin, ASI_IMG_RAW16});
   cam.setStartPos({x, y});
-  cam.setControl(ASI_EXPOSURE, expUs);
-  cam.setControl(ASI_GAIN, gain);
-  cam.setControl(ASI_OFFSET, offset);
+  const auto setControl = [&cam](ASI_CONTROL_TYPE type, long value) {
+    try {
+      cam.setControl(type, value);
+    } catch (const mc::AsiError& e) {
+      throw std::runtime_error(std::string(mc::Camera::controlName(type)) + " value " +
+                               std::to_string(value) + " rejected: " + e.what());
+    }
+  };
+  setControl(ASI_EXPOSURE, expUs);
+  setControl(ASI_GAIN, gain);
+  setControl(ASI_OFFSET, offset);
   // Report what the camera actually applied, not what was requested
   const mc::RoiFormat r = cam.getRoi();
   const mc::StartPos p = cam.getStartPos();
@@ -152,6 +162,30 @@ std::string expose(mc::Camera& cam, const std::string& path) {
   return o.str();
 }
 
+// After a failed command: ASI error code if the SDK says this camera handle is closed or removed, else 0.
+int handleLost(const mc::Camera& cam) {
+  try {
+    cam.getRoi();
+  } catch (const mc::AsiError& e) {
+    if (e.code() == ASI_ERROR_CAMERA_CLOSED || e.code() == ASI_ERROR_CAMERA_REMOVED) return e.code();
+  }
+  return 0;
+}
+
+// Startup diagnostics go to stderr (camera.log): what the SDK enumerated before any open.
+void logEnumeration(const mc::CameraManager& mgr) {
+  std::fprintf(stderr, "asi_camd: SDK %s, ASIGetNumOfConnectedCameras = %d\n",
+               mc::CameraManager::sdkVersion().c_str(), mgr.reportedCount());
+  const auto& devices = mgr.devices();
+  for (std::size_t i = 0; i < devices.size(); ++i) {
+    const auto& d = devices[i];
+    std::fprintf(stderr, "asi_camd:   [%zu] %s ID %d, %ldx%ld, %d bit, USB3 camera %s, USB3 host %s\n", i,
+                 d.Name, d.CameraID, d.MaxWidth, d.MaxHeight, d.BitDepth,
+                 d.IsUSB3Camera == ASI_TRUE ? "yes" : "no", d.IsUSB3Host == ASI_TRUE ? "yes" : "no");
+  }
+  std::fflush(stderr);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -172,13 +206,24 @@ int main(int argc, char** argv) {
   const int index = argc > 1 ? std::atoi(argv[1]) : 0;
   std::unique_ptr<mc::CameraManager> mgr;
   mc::Camera* cam = nullptr;
+  std::string where;  // camera being opened, for the error reply
   try {
     mgr = std::make_unique<mc::CameraManager>();
-    if (mgr->devices().empty()) throw std::runtime_error("no ASI camera found");
+    logEnumeration(*mgr);
+    if (mgr->devices().empty())
+      throw std::runtime_error("no ASI camera found (SDK reported " + std::to_string(mgr->reportedCount()) +
+                               " connected)");
+    if (index >= 0 && index < static_cast<int>(mgr->devices().size())) {
+      const auto& d = mgr->devices()[index];
+      where = std::string(" [") + d.Name + ", index " + std::to_string(index) + ", ID " +
+              std::to_string(d.CameraID) + ", USB3 host " + (d.IsUSB3Host == ASI_TRUE ? "yes" : "no") + "]";
+    }
     cam = mgr->open(index);
     cam->stopVideoCapture();
   } catch (const std::exception& e) {
-    reply(std::string("ERROR ") + e.what());
+    std::fprintf(stderr, "asi_camd: startup failed: %s%s\n", e.what(), where.c_str());
+    std::fflush(stderr);
+    reply(std::string("ERROR ") + e.what() + where);
     return 1;
   }
   const auto& info = cam->info();
@@ -215,8 +260,34 @@ int main(int argc, char** argv) {
         throw std::runtime_error("unknown command: " + cmd);
       }
     } catch (const std::exception& e) {
-      reply(std::string("ERROR ") + e.what());
-      if (g_abort) break;
+      if (g_abort) {
+        reply(std::string("ERROR ") + e.what());
+        break;
+      }
+      // Device check after a failed camera command. The SDK no longer enumerating a camera means the
+      // USB device is gone; a handle the SDK reports as closed/removed can never work again. Either
+      // is reported once and the process exits; the client releases it (no retry, no new process).
+      std::string fatal;
+      int code = 0;
+      if (cmd == "CONFIG" || cmd == "EXPOSE") {
+        if (ASIGetNumOfConnectedCameras() == 0) {
+          fatal = "USB device disappeared (SDK reports 0 cameras connected)";
+          code = 2;
+        } else if (const int lost = handleLost(*cam)) {
+          fatal = "camera handle lost: SDK reports the camera " +
+                  std::string(lost == ASI_ERROR_CAMERA_CLOSED ? "closed" : "removed") + " (ASI error " +
+                  std::to_string(lost) + "); reconnect";
+          code = 3;
+        }
+      }
+      std::fprintf(stderr, "asi_camd: %s failed: %s%s\n", cmd.c_str(), e.what(),
+                   fatal.empty() ? "" : ("; " + fatal + ", exiting").c_str());
+      std::fflush(stderr);
+      reply(std::string("ERROR ") + e.what() + (fatal.empty() ? "" : "; " + fatal));
+      if (code) {
+        mgr->close();
+        return code;
+      }
     }
   }
   mgr->close();

@@ -14,7 +14,9 @@ namespace mc {
 class AsiError : public std::runtime_error {
 public:
   AsiError(const std::string& what, ASI_ERROR_CODE code)
-      : std::runtime_error(what + ": " + errorString(code)), code_(code) {}
+      : std::runtime_error(what + ": " + errorString(code) + " (ASI error " +
+                           std::to_string(static_cast<int>(code)) + ")"),
+        code_(code) {}
   ASI_ERROR_CODE code() const noexcept { return code_; }
   static const char* errorString(ASI_ERROR_CODE c);
 
@@ -110,6 +112,8 @@ public:
   static int bytesPerPixel(ASI_IMG_TYPE t);
 
 private:
+  void readControls();
+
   int cameraId_;
   ASI_CAMERA_INFO info_;
   std::vector<ControlDescriptor> controls_;
@@ -125,6 +129,8 @@ public:
   void refresh();
 
   const std::vector<ASI_CAMERA_INFO>& devices() const noexcept { return devices_; }
+  // Count reported by ASIGetNumOfConnectedCameras (devices() holds only readable properties).
+  int reportedCount() const noexcept { return reported_; }
 
   // Open a camera by index in devices(). Returns shared ownership-ish:
   // there is only one open camera at a time. Caller must not delete.
@@ -137,6 +143,7 @@ public:
 
 private:
   std::vector<ASI_CAMERA_INFO> devices_;
+  int reported_ = 0;
   std::unique_ptr<Camera> open_;
 };
 

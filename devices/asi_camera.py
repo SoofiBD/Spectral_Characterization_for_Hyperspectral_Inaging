@@ -41,6 +41,7 @@ class ASICameraClient:
                               "hsi/lamda_hsi/build -DLAMDA_HSI_BUILD_GUI=OFF && "
                               "cmake --build hsi/lamda_hsi/build --target asi_camd")
         self.simulated = simulate
+        self.log_path = Path(log_path) if log_path else None  # shown to the user when the camera is lost
         self._log = open(log_path, "ab") if log_path else subprocess.DEVNULL
         self._lines: queue.Queue[str | None] = queue.Queue()
         self._lock = threading.Lock()

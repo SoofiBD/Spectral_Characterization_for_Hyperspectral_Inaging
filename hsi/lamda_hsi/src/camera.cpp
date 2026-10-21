@@ -23,7 +23,7 @@ const char* AsiError::errorString(ASI_ERROR_CODE c) {
     case ASI_ERROR_BUFFER_TOO_SMALL:        return "buffer too small";
     case ASI_ERROR_VIDEO_MODE_ACTIVE:       return "video mode active";
     case ASI_ERROR_EXPOSURE_IN_PROGRESS:    return "exposure in progress";
-    case ASI_ERROR_GENERAL_ERROR:           return "general error (value out of range?)";
+    case ASI_ERROR_GENERAL_ERROR:           return "general error";
     case ASI_ERROR_INVALID_MODE:            return "invalid mode";
     default:                                return "unknown error";
   }
@@ -87,12 +87,16 @@ int Camera::bytesPerPixel(ASI_IMG_TYPE t) {
 Camera::Camera(int cameraId, const ASI_CAMERA_INFO& info)
     : cameraId_(cameraId), info_(info) {
   asiCheck(ASIOpenCamera(cameraId_), "ASIOpenCamera");
-  ASI_ERROR_CODE rc = ASIInitCamera(cameraId_);
-  if (rc != ASI_SUCCESS) {
+  try {  // a throwing constructor runs no destructor: close the opened camera on every failure
+    asiCheck(ASIInitCamera(cameraId_), "ASIInitCamera");
+    readControls();
+  } catch (...) {
     ASICloseCamera(cameraId_);
-    throw AsiError("ASIInitCamera", rc);
+    throw;
   }
+}
 
+void Camera::readControls() {
   int nctrl = 0;
   asiCheck(ASIGetNumOfControls(cameraId_, &nctrl), "ASIGetNumOfControls");
   controls_.reserve(nctrl);
@@ -248,7 +252,8 @@ void CameraManager::refresh() {
   close();
   devices_.clear();
   int n = ASIGetNumOfConnectedCameras();
-  devices_.reserve(n);
+  reported_ = n;
+  devices_.reserve(n > 0 ? n : 0);
   for (int i = 0; i < n; ++i) {
     ASI_CAMERA_INFO info{};
     if (ASIGetCameraProperty(&info, i) == ASI_SUCCESS) {
